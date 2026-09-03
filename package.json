@@ -1,0 +1,56 @@
+{
+  "name": "process-supervisor",
+  "version": "0.1.0",
+  "description": "Supervise owned subprocess trees with crash-safe identity, persistence, and durable service adoption.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "scripts": {
+    "clean": "node ./scripts/clean.mjs",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node ./scripts/test.mjs",
+    "check": "npm run typecheck && npm test && npm run build",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run check"
+  },
+  "keywords": [
+    "process",
+    "supervisor",
+    "subprocess",
+    "process-tree",
+    "developer-tools"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/speto/process-supervisor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/speto/process-supervisor/issues"
+  },
+  "homepage": "https://github.com/speto/process-supervisor#readme",
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "typescript": "7.0.2"
+  }
+}

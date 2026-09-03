@@ -1,0 +1,221 @@
+import {constants as fsConstants} from 'node:fs';
+import {access, stat} from 'node:fs/promises';
+import {createHash} from 'node:crypto';
+import {isAbsolute} from 'node:path';
+import {ProcessSupervisorError} from './errors.js';
+import type {
+  DurableProcessRecord,
+  JsonValue,
+  ManagedProcessSnapshot,
+  ManagedProcessSpec,
+  ProcessInspection,
+  ProcessIoMode,
+  ProcessRecoveryPolicy,
+  ProcessShutdownPolicy,
+} from './types.js';
+
+const MAX_PROCESS_ID_BYTES = 128;
+
+export interface NormalizedProcessSpec {
+  id: string;
+  executable: string;
+  args: readonly string[];
+  cwd: string;
+  ioMode: ProcessIoMode;
+  recoveryPolicy: ProcessRecoveryPolicy;
+  shutdownPolicy: ProcessShutdownPolicy;
+  environment: ManagedProcessSpec['environment'];
+  metadata: Readonly<Record<string, JsonValue>>;
+}
+
+export function normalizeSpec(spec: ManagedProcessSpec): NormalizedProcessSpec {
+  if (!spec || typeof spec !== 'object') {
+    throw new ProcessSupervisorError('INVALID_SPEC', 'Managed process specification is required.');
+  }
+  if (typeof spec.id !== 'string' || spec.id.length === 0 || Buffer.byteLength(spec.id, 'utf8') > MAX_PROCESS_ID_BYTES) {
+    throw new ProcessSupervisorError('INVALID_SPEC', `Managed process id must be 1-${MAX_PROCESS_ID_BYTES} UTF-8 bytes.`);
+  }
+  if (!Array.isArray(spec.args) || spec.args.some((value) => typeof value !== 'string')) {
+    throw new ProcessSupervisorError('INVALID_SPEC', 'Managed process arguments must be an array of strings.');
+  }
+
+  const ioMode = spec.ioMode ?? 'pipe';
+  const recoveryPolicy = spec.recoveryPolicy ?? 'terminate';
+  const shutdownPolicy = spec.shutdownPolicy ?? 'terminate';
+  if (ioMode !== 'pipe' && ioMode !== 'durable-log') {
+    throw new ProcessSupervisorError('INVALID_SPEC', `Unsupported I/O mode: ${String(ioMode)}.`);
+  }
+  if (recoveryPolicy !== 'terminate' && recoveryPolicy !== 'adopt') {
+    throw new ProcessSupervisorError('INVALID_SPEC', `Unsupported recovery policy: ${String(recoveryPolicy)}.`);
+  }
+  if (shutdownPolicy !== 'terminate' && shutdownPolicy !== 'preserve') {
+    throw new ProcessSupervisorError('INVALID_SPEC', `Unsupported shutdown policy: ${String(shutdownPolicy)}.`);
+  }
+  if (recoveryPolicy === 'adopt' && ioMode !== 'durable-log') {
+    throw new ProcessSupervisorError('UNSUPPORTED_RECOVERY', 'Adopt recovery requires durable-log I/O.');
+  }
+  if (shutdownPolicy === 'preserve' && ioMode !== 'durable-log') {
+    throw new ProcessSupervisorError('UNSUPPORTED_RECOVERY', 'Preserve shutdown requires durable-log I/O.');
+  }
+
+  return {
+    id: spec.id,
+    executable: spec.executable,
+    args: [...spec.args],
+    cwd: spec.cwd,
+    ioMode,
+    recoveryPolicy,
+    shutdownPolicy,
+    environment: spec.environment,
+    metadata: cloneMetadata(spec.metadata ?? {}),
+  };
+}
+
+export async function validateSpec(spec: NormalizedProcessSpec): Promise<void> {
+  if (!isAbsolute(spec.executable)) {
+    throw new ProcessSupervisorError('INVALID_SPEC', 'Managed process executable must be an absolute path.');
+  }
+  if (!isAbsolute(spec.cwd)) {
+    throw new ProcessSupervisorError('INVALID_SPEC', 'Managed process working directory must be an absolute path.');
+  }
+  await access(spec.executable, fsConstants.X_OK).catch((error) => {
+    throw new ProcessSupervisorError(
+      'INVALID_SPEC',
+      `Managed process executable is unavailable or not executable: ${messageOf(error)}`,
+      {cause: error},
+    );
+  });
+  const cwd = await stat(spec.cwd).catch((error) => {
+    throw new ProcessSupervisorError(
+      'INVALID_SPEC',
+      `Managed process working directory is unavailable: ${messageOf(error)}`,
+      {cause: error},
+    );
+  });
+  if (!cwd.isDirectory()) {
+    throw new ProcessSupervisorError('INVALID_SPEC', 'Managed process working directory must be a directory.');
+  }
+}
+
+export function startingSnapshot(spec: NormalizedProcessSpec): ManagedProcessSnapshot {
+  return {
+    id: spec.id,
+    state: 'starting',
+    origin: null,
+    pid: null,
+    processGroupId: null,
+    startedAt: null,
+    lastExitCode: null,
+    lastSignal: null,
+    error: null,
+    forcedTermination: false,
+    ioMode: spec.ioMode,
+    recoveryPolicy: spec.recoveryPolicy,
+    shutdownPolicy: spec.shutdownPolicy,
+    metadata: cloneMetadata(spec.metadata),
+  };
+}
+
+export function snapshotFromRecord(
+  record: DurableProcessRecord,
+  state: ManagedProcessSnapshot['state'],
+  origin: ManagedProcessSnapshot['origin'],
+  error: string | null,
+): ManagedProcessSnapshot {
+  const running = state === 'running' || state === 'stopping';
+  return {
+    id: record.id,
+    state,
+    origin,
+    pid: running ? record.pid : null,
+    processGroupId: running ? record.processGroupId : null,
+    startedAt: running ? record.identity.startedAt : null,
+    lastExitCode: null,
+    lastSignal: null,
+    error,
+    forcedTermination: false,
+    ioMode: record.ioMode,
+    recoveryPolicy: record.recoveryPolicy,
+    shutdownPolicy: record.shutdownPolicy,
+    metadata: cloneMetadata(record.metadata),
+  };
+}
+
+export function emptySnapshot(processId: string): ManagedProcessSnapshot {
+  return {
+    id: processId,
+    state: 'stopped',
+    origin: null,
+    pid: null,
+    processGroupId: null,
+    startedAt: null,
+    lastExitCode: null,
+    lastSignal: null,
+    error: null,
+    forcedTermination: false,
+    ioMode: null,
+    recoveryPolicy: null,
+    shutdownPolicy: null,
+    metadata: {},
+  };
+}
+
+export function identityFromInspection(inspection: ProcessInspection): DurableProcessRecord['identity'] {
+  return {
+    startedAt: inspection.startedAt,
+    commandFingerprint: commandFingerprint(inspection.commandLine),
+  };
+}
+
+export function identityMatches(record: DurableProcessRecord, inspection: ProcessInspection): boolean {
+  return record.pid === inspection.pid
+    && record.processGroupId === inspection.processGroupId
+    && record.identity.startedAt === inspection.startedAt
+    && record.identity.commandFingerprint === commandFingerprint(inspection.commandLine);
+}
+
+export function cloneSnapshot(snapshot: ManagedProcessSnapshot): ManagedProcessSnapshot {
+  return {...snapshot, metadata: cloneMetadata(snapshot.metadata)};
+}
+
+export function cloneMetadata(
+  metadata: Readonly<Record<string, JsonValue>>,
+): Readonly<Record<string, JsonValue>> {
+  assertJsonValue(metadata, 'metadata');
+  return JSON.parse(JSON.stringify(metadata)) as Record<string, JsonValue>;
+}
+
+function assertJsonValue(value: unknown, path: string): asserts value is JsonValue {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw invalidMetadata(`${path} contains a non-finite number.`);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertJsonValue(item, `${path}[${index}]`));
+    return;
+  }
+  if (typeof value === 'object') {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw invalidMetadata(`${path} must contain only plain JSON objects.`);
+    }
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      assertJsonValue(item, `${path}.${key}`);
+    }
+    return;
+  }
+  throw invalidMetadata(`${path} contains a non-JSON value.`);
+}
+
+function invalidMetadata(message: string): ProcessSupervisorError {
+  return new ProcessSupervisorError('INVALID_SPEC', message);
+}
+
+function commandFingerprint(commandLine: string): string {
+  return createHash('sha256').update(commandLine, 'utf8').digest('hex');
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
