@@ -123,14 +123,13 @@ export class ProcessSupervisor {
 
   start(spec: ManagedProcessSpec): Promise<ManagedProcessSnapshot> {
     this.assertOpen();
-    const normalized = normalizeSpec(spec);
-    return this.runOwned(() => this.startLocked(normalized));
+    return this.runOwned(() => this.startLocked(normalizeSpec(spec)));
   }
 
   restart(spec: ManagedProcessSpec): Promise<ManagedProcessSnapshot> {
     this.assertOpen();
-    const normalized = normalizeSpec(spec);
     return this.runOwned(async () => {
+      const normalized = normalizeSpec(spec);
       if (this.runtimes.has(normalized.id)) await this.stopLocked(normalized.id);
       return this.startLocked(normalized);
     });
