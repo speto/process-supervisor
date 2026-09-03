@@ -1,9 +1,9 @@
-import {mkdir, open, stat} from 'node:fs/promises';
-import {spawn, type ChildProcess} from 'node:child_process';
+import {mkdir, open, readdir, rm, stat} from 'node:fs/promises';
+import {type ChildProcess} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
 import {join} from 'node:path';
 import {buildChildEnvironment} from './environment.js';
-import {positiveInteger, terminateKnownProcessGroup, waitForInspection, waitForSpawn} from './lifecycle.js';
+import {positiveInteger, terminateKnownProcessScope, waitForInspection, waitForSpawn} from './lifecycle.js';
 import {DurableOutputFollower, attachPipeOutput} from './output.js';
 import {identityFromInspection, type NormalizedProcessSpec} from './process-spec.js';
 import type {
@@ -11,6 +11,7 @@ import type {
   DurableProcessRecord,
   ManagedProcessOutputEvent,
   ManagedProcessOutputStream,
+  ManagedProcessTransport,
   ProcessPlatform,
   ProcessRecordStore,
 } from './types.js';
@@ -21,8 +22,8 @@ export interface RuntimeProcess {
   readonly record: DurableProcessRecord;
   readonly child: ChildProcess | null;
   readonly followers: DurableOutputFollower[];
+  readonly transport: ManagedProcessTransport | null;
   expectedStop: boolean;
-  monitorTimer: NodeJS.Timeout | null;
 }
 
 export interface ProcessRuntimeContext {
@@ -33,8 +34,21 @@ export interface ProcessRuntimeContext {
   forcedShutdownMs: number;
   groupPollMs: number;
   logPollMs: number;
+  maxRetainedLogLaunches: number;
   now: () => Date;
   onOutput: (event: ManagedProcessOutputEvent) => void;
+}
+
+export class ProcessLaunchFailure extends Error {
+  constructor(
+    readonly originalError: unknown,
+    readonly cleanupError: unknown,
+    readonly residualRuntime: RuntimeProcess | null,
+    readonly recordPersisted: boolean,
+  ) {
+    super(`Launch failed and residual process cleanup also failed: ${messageOf(cleanupError)}`, {cause: originalError});
+    this.name = 'ProcessLaunchFailure';
+  }
 }
 
 export async function launchProcess(
@@ -44,6 +58,7 @@ export async function launchProcess(
 ): Promise<RuntimeProcess> {
   let durableLogs: DurableLogFiles | null = null;
   let child: ChildProcess | null = null;
+  let record: DurableProcessRecord | null = null;
   let recordSaved = false;
 
   try {
@@ -51,32 +66,31 @@ export async function launchProcess(
       ? await prepareDurableLogFiles(spec.id, context)
       : null;
 
-    child = spawn(spec.executable, [...spec.args], {
+    child = context.platform.spawn({
+      executable: spec.executable,
+      args: spec.args,
       cwd: spec.cwd,
-      detached: true,
-      shell: false,
       stdio: durableLogs
         ? ['ignore', durableLogs.stdoutHandle.fd, durableLogs.stderrHandle.fd]
-        : ['ignore', 'pipe', 'pipe'],
+        : spec.ioMode === 'pipe'
+          ? ['pipe', 'pipe', 'pipe']
+          : ['ignore', 'pipe', 'pipe'],
       env: buildChildEnvironment(spec.executable, spec.environment),
     });
 
-    if (!durableLogs) attachChildOutput(spec.id, child, context.onOutput);
+    if (spec.ioMode === 'line') attachChildOutput(spec.id, child, context.onOutput);
     const launchedChild = child;
     child.once('exit', (code, signal) => onExit(launchedChild, code, signal));
 
     const pid = await waitForSpawn(child);
     const inspection = await waitForInspection(context.platform, pid, 500, context.groupPollMs);
     if (!inspection) throw new Error(`Process ${spec.id} exited before its identity could be captured.`);
-    if (inspection.processGroupId !== pid) {
-      throw new Error(`Process ${spec.id} did not start in the expected isolated process group.`);
-    }
 
-    const record: DurableProcessRecord = {
-      schemaVersion: 1,
+    record = {
+      schemaVersion: 2,
       id: spec.id,
       pid,
-      processGroupId: inspection.processGroupId,
+      scope: inspection.scope,
       executable: spec.executable,
       cwd: spec.cwd,
       ioMode: spec.ioMode,
@@ -91,14 +105,7 @@ export async function launchProcess(
     await context.recordStore.save(record);
     recordSaved = true;
 
-    const runtime: RuntimeProcess = {
-      record,
-      child,
-      followers: createFollowers(record, context),
-      expectedStop: false,
-      monitorTimer: null,
-    };
-
+    const runtime = createRuntime(record, child, context);
     if (durableLogs) {
       child.unref();
       await Promise.all(runtime.followers.map((follower) => follower.start(false)));
@@ -107,15 +114,13 @@ export async function launchProcess(
     return runtime;
   } catch (error) {
     if (child?.pid) {
-      await terminateKnownProcessGroup(
-        context.platform,
-        child.pid,
-        context.gracefulShutdownMs,
-        context.forcedShutdownMs,
-        context.groupPollMs,
-      ).catch(() => undefined);
+      const cleanup = await cleanupFailedLaunch(child, record, recordSaved, context);
+      if (cleanup.error) {
+        throw new ProcessLaunchFailure(error, cleanup.error, cleanup.runtime, cleanup.recordPersisted);
+      }
+      recordSaved = cleanup.recordPersisted;
     }
-    if (recordSaved) await context.recordStore.remove(spec.id).catch(() => undefined);
+    if (recordSaved && record) await context.recordStore.remove(spec.id);
     throw error;
   } finally {
     await durableLogs?.stdoutHandle.close().catch(() => undefined);
@@ -131,13 +136,7 @@ export async function adoptProcess(
     throw new Error('Only durable-log processes can be adopted.');
   }
 
-  const runtime: RuntimeProcess = {
-    record,
-    child: null,
-    followers: createFollowers(record, context),
-    expectedStop: false,
-    monitorTimer: null,
-  };
+  const runtime = createRuntime(record, null, context);
   try {
     await Promise.all(runtime.followers.map((follower) => follower.start(true)));
     return runtime;
@@ -173,9 +172,34 @@ export async function readDurableOutputTail(
 }
 
 export function releaseRuntime(runtime: RuntimeProcess): void {
-  if (runtime.monitorTimer) clearTimeout(runtime.monitorTimer);
-  runtime.monitorTimer = null;
   for (const follower of runtime.followers) follower.close();
+}
+
+export async function pruneDurableLogs(
+  stateDirectory: string,
+  processId: string,
+  keepLaunches: number,
+): Promise<void> {
+  const directory = logDirectory(stateDirectory, processId);
+  let names: string[];
+  try {
+    names = await readdir(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return;
+    throw error;
+  }
+
+  const launches = new Map<string, string[]>();
+  for (const name of names) {
+    const match = name.match(/^(.*)\.(stdout|stderr)\.log$/);
+    if (!match?.[1]) continue;
+    const files = launches.get(match[1]) ?? [];
+    files.push(name);
+    launches.set(match[1], files);
+  }
+
+  const stale = [...launches.keys()].sort().slice(0, Math.max(0, launches.size - keepLaunches));
+  await Promise.all(stale.flatMap((launch) => (launches.get(launch) ?? []).map((name) => rm(join(directory, name), {force: true}))));
 }
 
 interface DurableLogFiles {
@@ -184,13 +208,61 @@ interface DurableLogFiles {
   stderrHandle: Awaited<ReturnType<typeof open>>;
 }
 
+interface FailedLaunchCleanupResult {
+  error: unknown | null;
+  runtime: RuntimeProcess | null;
+  recordPersisted: boolean;
+}
+
+async function cleanupFailedLaunch(
+  child: ChildProcess,
+  record: DurableProcessRecord | null,
+  recordSaved: boolean,
+  context: ProcessRuntimeContext,
+): Promise<FailedLaunchCleanupResult> {
+  if (!record) {
+    try {
+      child.kill('SIGKILL');
+      return {error: null, runtime: null, recordPersisted: false};
+    } catch (error) {
+      return {error, runtime: null, recordPersisted: false};
+    }
+  }
+
+  try {
+    await terminateKnownProcessScope(
+      context.platform,
+      record.scope,
+      context.gracefulShutdownMs,
+      context.forcedShutdownMs,
+      context.groupPollMs,
+    );
+    return {error: null, runtime: null, recordPersisted: recordSaved};
+  } catch (cleanupError) {
+    let persisted = recordSaved;
+    if (!persisted) {
+      try {
+        await context.recordStore.save(record);
+        persisted = true;
+      } catch {
+        // In-memory ownership is still retained even if durable persistence is unavailable.
+      }
+    }
+    return {
+      error: cleanupError,
+      runtime: createRuntime(record, child, context),
+      recordPersisted: persisted,
+    };
+  }
+}
+
 async function prepareDurableLogFiles(
   processId: string,
   context: ProcessRuntimeContext,
 ): Promise<DurableLogFiles> {
-  const encodedId = Buffer.from(processId, 'utf8').toString('base64url');
-  const directory = join(context.stateDirectory, 'logs', encodedId);
+  const directory = logDirectory(context.stateDirectory, processId);
   await mkdir(directory, {recursive: true, mode: 0o700});
+  await pruneDurableLogs(context.stateDirectory, processId, Math.max(0, context.maxRetainedLogLaunches - 1));
   const launch = `${context.now().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}`;
   const logs = {
     stdoutPath: join(directory, `${launch}.stdout.log`),
@@ -204,6 +276,27 @@ async function prepareDurableLogFiles(
     await stdoutHandle.close().catch(() => undefined);
     throw error;
   }
+}
+
+function createRuntime(
+  record: DurableProcessRecord,
+  child: ChildProcess | null,
+  context: ProcessRuntimeContext,
+): RuntimeProcess {
+  return {
+    record,
+    child,
+    followers: createFollowers(record, context),
+    transport: child && record.ioMode === 'pipe' ? transportOf(child) : null,
+    expectedStop: false,
+  };
+}
+
+function transportOf(child: ChildProcess): ManagedProcessTransport {
+  if (!child.stdin || !child.stdout || !child.stderr) {
+    throw new Error('Raw pipe process did not expose stdin/stdout/stderr streams.');
+  }
+  return {stdin: child.stdin, stdout: child.stdout, stderr: child.stderr};
 }
 
 function createFollowers(
@@ -224,4 +317,12 @@ function attachChildOutput(
 ): void {
   if (child.stdout) attachPipeOutput(processId, child.stdout, 'stdout', emit);
   if (child.stderr) attachPipeOutput(processId, child.stderr, 'stderr', emit);
+}
+
+function logDirectory(stateDirectory: string, processId: string): string {
+  return join(stateDirectory, 'logs', Buffer.from(processId, 'utf8').toString('base64url'));
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

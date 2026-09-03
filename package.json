@@ -1,7 +1,7 @@
 {
   "name": "process-supervisor",
   "version": "0.1.0",
-  "description": "Supervise owned subprocess trees with crash-safe identity, persistence, and durable service adoption.",
+  "description": "Supervise owned subprocess scopes with persistent ownership and restart reconciliation.",
   "license": "MIT",
   "type": "module",
   "sideEffects": false,
@@ -21,10 +21,6 @@
   "engines": {
     "node": ">=22"
   },
-  "os": [
-    "darwin",
-    "linux"
-  ],
   "scripts": {
     "clean": "node ./scripts/clean.mjs",
     "build": "npm run clean && tsc -p tsconfig.build.json",
@@ -38,7 +34,7 @@
     "process",
     "supervisor",
     "subprocess",
-    "process-tree",
+    "process-group",
     "developer-tools"
   ],
   "repository": {

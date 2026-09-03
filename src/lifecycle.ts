@@ -1,6 +1,6 @@
 import type {ChildProcess} from 'node:child_process';
 import {ProcessSupervisorError} from './errors.js';
-import type {ProcessInspection, ProcessPlatform} from './types.js';
+import type {ProcessInspection, ProcessPlatform, ProcessScope} from './types.js';
 
 export function waitForSpawn(child: ChildProcess): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -41,20 +41,20 @@ export async function waitForInspection(
   }
 }
 
-export async function terminateKnownProcessGroup(
+export async function terminateKnownProcessScope(
   platform: ProcessPlatform,
-  processGroupId: number,
+  scope: ProcessScope,
   gracefulShutdownMs: number,
   forcedShutdownMs: number,
-  groupPollMs: number,
+  pollMs: number,
 ): Promise<boolean> {
-  if (!await platform.isProcessGroupAlive(processGroupId)) return false;
-  await platform.signalProcessGroup(processGroupId, 'SIGTERM');
-  if (await waitForProcessGroupExit(platform, processGroupId, gracefulShutdownMs, groupPollMs)) return false;
+  if (!await platform.isScopeAlive(scope)) return false;
+  await platform.terminateScope(scope, 'graceful');
+  if (await waitForProcessScopeExit(platform, scope, gracefulShutdownMs, pollMs)) return false;
 
-  await platform.signalProcessGroup(processGroupId, 'SIGKILL');
-  if (!await waitForProcessGroupExit(platform, processGroupId, forcedShutdownMs, groupPollMs)) {
-    throw new Error(`Process group ${processGroupId} did not exit after SIGKILL.`);
+  await platform.terminateScope(scope, 'force');
+  if (!await waitForProcessScopeExit(platform, scope, forcedShutdownMs, pollMs)) {
+    throw new Error(`Process scope ${scope.kind}:${scope.id} did not exit after forced termination.`);
   }
   return true;
 }
@@ -69,18 +69,23 @@ export function positiveInteger(value: number, label: string): number {
   return value;
 }
 
+export function nonNegativeInteger(value: number, label: string): number {
+  if (!Number.isInteger(value) || value < 0) throw new ProcessSupervisorError('INVALID_SPEC', `${label} must be a non-negative integer.`);
+  return value;
+}
+
 export function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function waitForProcessGroupExit(
+async function waitForProcessScopeExit(
   platform: ProcessPlatform,
-  processGroupId: number,
+  scope: ProcessScope,
   timeoutMs: number,
   pollMs: number,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
-  while (await platform.isProcessGroupAlive(processGroupId)) {
+  while (await platform.isScopeAlive(scope)) {
     if (Date.now() >= deadline) return false;
     await delay(Math.min(pollMs, Math.max(1, deadline - Date.now())));
   }

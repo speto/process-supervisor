@@ -7,6 +7,7 @@ import type {
   JsonValue,
   ProcessRecordEntry,
   ProcessRecordStore,
+  ProcessScope,
 } from './types.js';
 
 const RECORDS_DIRECTORY = 'records';
@@ -91,10 +92,12 @@ export class FileProcessRecordStore implements ProcessRecordStore {
 export function parseDurableProcessRecord(value: unknown): DurableProcessRecord {
   const record = objectValue(value, 'process record');
   const schemaVersion = integer(record.schemaVersion, 'schemaVersion');
-  if (schemaVersion !== 1) throw new Error(`Unsupported process record schema version: ${schemaVersion}.`);
+  if (schemaVersion !== 2) throw new Error(`Unsupported process record schema version: ${schemaVersion}.`);
 
   const ioMode = stringValue(record.ioMode, 'ioMode');
-  if (ioMode !== 'pipe' && ioMode !== 'durable-log') throw new Error(`Invalid process record ioMode: ${ioMode}.`);
+  if (ioMode !== 'line' && ioMode !== 'pipe' && ioMode !== 'durable-log') {
+    throw new Error(`Invalid process record ioMode: ${ioMode}.`);
+  }
 
   const recoveryPolicy = stringValue(record.recoveryPolicy, 'recoveryPolicy');
   if (recoveryPolicy !== 'terminate' && recoveryPolicy !== 'adopt') throw new Error(`Invalid process record recoveryPolicy: ${recoveryPolicy}.`);
@@ -116,11 +119,15 @@ export function parseDurableProcessRecord(value: unknown): DurableProcessRecord 
     throw new Error('durable-log process record is missing log paths.');
   }
 
+  const commandFingerprint = identityValue.commandFingerprint === undefined
+    ? undefined
+    : sha256Fingerprint(identityValue.commandFingerprint, 'identity.commandFingerprint');
+
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: nonEmptyString(record.id, 'id'),
     pid: positiveInteger(record.pid, 'pid'),
-    processGroupId: positiveInteger(record.processGroupId, 'processGroupId'),
+    scope: parseScope(record.scope),
     executable: nonEmptyString(record.executable, 'executable'),
     cwd: nonEmptyString(record.cwd, 'cwd'),
     ioMode,
@@ -128,11 +135,20 @@ export function parseDurableProcessRecord(value: unknown): DurableProcessRecord 
     shutdownPolicy,
     identity: {
       startedAt: nonEmptyString(identityValue.startedAt, 'identity.startedAt'),
-      commandFingerprint: sha256Fingerprint(identityValue.commandFingerprint, 'identity.commandFingerprint'),
+      stableId: nonEmptyString(identityValue.stableId, 'identity.stableId'),
+      ...(commandFingerprint === undefined ? {} : {commandFingerprint}),
     },
     ...(logs === undefined ? {} : {logs}),
     createdAt: nonEmptyString(record.createdAt, 'createdAt'),
     metadata,
+  };
+}
+
+function parseScope(value: unknown): ProcessScope {
+  const scope = objectValue(value, 'scope');
+  return {
+    kind: nonEmptyString(scope.kind, 'scope.kind'),
+    id: nonEmptyString(scope.id, 'scope.id'),
   };
 }
 

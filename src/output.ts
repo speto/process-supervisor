@@ -5,6 +5,7 @@ import type {ManagedProcessOutputEvent, ManagedProcessOutputStream} from './type
 
 const MAX_READ_CHUNK_BYTES = 64 * 1024;
 const MAX_PARTIAL_LINE_CHARS = 64 * 1024;
+const MAX_IDLE_POLL_MS = 2_000;
 
 export class DurableOutputFollower {
   private active = false;
@@ -12,6 +13,7 @@ export class DurableOutputFollower {
   private buffer = '';
   private timer: NodeJS.Timeout | null = null;
   private decoder = new StringDecoder('utf8');
+  private currentPollMs: number;
 
   constructor(
     private readonly processId: string,
@@ -19,11 +21,14 @@ export class DurableOutputFollower {
     private readonly filePath: string,
     private readonly pollMs: number,
     private readonly emit: (event: ManagedProcessOutputEvent) => void,
-  ) {}
+  ) {
+    this.currentPollMs = pollMs;
+  }
 
   async start(atEnd: boolean): Promise<void> {
     if (this.active) return;
     this.active = true;
+    this.currentPollMs = this.pollMs;
     if (atEnd) {
       try {
         this.offset = (await stat(this.filePath)).size;
@@ -41,6 +46,7 @@ export class DurableOutputFollower {
     this.buffer = '';
     this.decoder.end();
     this.decoder = new StringDecoder('utf8');
+    this.currentPollMs = this.pollMs;
   }
 
   private schedule(delayMs: number): void {
@@ -51,6 +57,7 @@ export class DurableOutputFollower {
 
   private async poll(): Promise<void> {
     if (!this.active) return;
+    let consumedBytes = false;
     try {
       const file = await stat(this.filePath);
       if (file.size < this.offset) {
@@ -69,6 +76,7 @@ export class DurableOutputFollower {
             const bytes = Buffer.allocUnsafe(readLength);
             const result = await handle.read(bytes, 0, readLength, this.offset);
             if (result.bytesRead === 0) break;
+            consumedBytes = true;
             this.offset += result.bytesRead;
             remaining -= result.bytesRead;
             this.consume(this.decoder.write(bytes.subarray(0, result.bytesRead)));
@@ -82,7 +90,10 @@ export class DurableOutputFollower {
         // A transient log-read failure must not destabilize process ownership.
       }
     } finally {
-      this.schedule(this.pollMs);
+      this.currentPollMs = consumedBytes
+        ? this.pollMs
+        : Math.min(Math.max(this.pollMs, this.currentPollMs * 2), MAX_IDLE_POLL_MS);
+      this.schedule(this.currentPollMs);
     }
   }
 

@@ -4,8 +4,10 @@ import {ProcessSupervisorError} from './errors.js';
 import {
   messageOf,
   positiveFinite,
-  terminateKnownProcessGroup,
+  positiveInteger,
+  terminateKnownProcessScope,
 } from './lifecycle.js';
+import {OwnershipCoordinator} from './ownership-coordinator.js';
 import {PosixProcessPlatform} from './platform/posix-process-platform.js';
 import {
   cloneSnapshot,
@@ -20,6 +22,8 @@ import {
 import {
   adoptProcess,
   launchProcess,
+  ProcessLaunchFailure,
+  pruneDurableLogs,
   readDurableOutputTail,
   releaseRuntime,
   type ProcessRuntimeContext,
@@ -27,24 +31,28 @@ import {
 } from './process-runtime.js';
 import {reconcileProcessRecords} from './reconciliation.js';
 import {FileProcessRecordStore} from './record-store.js';
+import {FileStateDirectoryLock} from './state-directory-lock.js';
 import type {
   DurableProcessRecord,
   ManagedProcessOutputEvent,
   ManagedProcessOutputStream,
   ManagedProcessSnapshot,
   ManagedProcessSpec,
+  ManagedProcessStateEvent,
+  ManagedProcessTransport,
   ProcessPlatform,
   ProcessRecordStore,
   ProcessSupervisorOptions,
-  ManagedProcessStateEvent,
   ReconciliationResult,
 } from './types.js';
 
 const DEFAULT_GRACEFUL_SHUTDOWN_MS = 5_000;
 const DEFAULT_FORCED_SHUTDOWN_MS = 2_000;
 const DEFAULT_GROUP_POLL_MS = 25;
-const DEFAULT_MONITOR_POLL_MS = 1_000;
-const DEFAULT_LOG_POLL_MS = 100;
+const DEFAULT_MONITOR_POLL_MS = 2_000;
+const DEFAULT_LOG_POLL_MS = 250;
+const DEFAULT_RETAINED_LOG_LAUNCHES = 3;
+const DEFAULT_RETAINED_SNAPSHOTS = 256;
 
 export class ProcessSupervisor {
   private readonly recordStore: ProcessRecordStore;
@@ -54,14 +62,18 @@ export class ProcessSupervisor {
   private readonly groupPollMs: number;
   private readonly monitorPollMs: number;
   private readonly logPollMs: number;
+  private readonly maxRetainedLogLaunches: number;
+  private readonly maxRetainedSnapshots: number;
   private readonly now: () => Date;
   private readonly onState: (event: ManagedProcessStateEvent) => void;
   private readonly onOutput: (event: ManagedProcessOutputEvent) => void;
   private readonly runtimes = new Map<string, RuntimeProcess>();
   private readonly snapshots = new Map<string, ManagedProcessSnapshot>();
-  private readonly lifecycleQueues = new Map<string, Promise<void>>();
+  private readonly coordinator = new OwnershipCoordinator();
+  private readonly stateLock: FileStateDirectoryLock | null;
+  private stateOwnership: Promise<void> | null = null;
+  private monitorTimer: NodeJS.Timeout | null = null;
   private closed = false;
-  private closing: Promise<void> | null = null;
 
   constructor(private readonly options: ProcessSupervisorOptions) {
     if (!isAbsolute(options.stateDirectory)) {
@@ -69,11 +81,16 @@ export class ProcessSupervisor {
     }
     this.recordStore = options.recordStore ?? new FileProcessRecordStore(options.stateDirectory);
     this.platform = options.platform ?? new PosixProcessPlatform();
+    this.stateLock = this.recordStore instanceof FileProcessRecordStore
+      ? new FileStateDirectoryLock(this.recordStore.stateDirectory)
+      : null;
     this.gracefulShutdownMs = positiveFinite(options.gracefulShutdownMs ?? DEFAULT_GRACEFUL_SHUTDOWN_MS, 'Graceful shutdown timeout');
     this.forcedShutdownMs = positiveFinite(options.forcedShutdownMs ?? DEFAULT_FORCED_SHUTDOWN_MS, 'Forced shutdown timeout');
-    this.groupPollMs = positiveFinite(options.groupPollMs ?? DEFAULT_GROUP_POLL_MS, 'Process group poll interval');
+    this.groupPollMs = positiveFinite(options.groupPollMs ?? DEFAULT_GROUP_POLL_MS, 'Process scope poll interval');
     this.monitorPollMs = positiveFinite(options.monitorPollMs ?? DEFAULT_MONITOR_POLL_MS, 'Process monitor poll interval');
     this.logPollMs = positiveFinite(options.logPollMs ?? DEFAULT_LOG_POLL_MS, 'Log poll interval');
+    this.maxRetainedLogLaunches = positiveInteger(options.maxRetainedLogLaunches ?? DEFAULT_RETAINED_LOG_LAUNCHES, 'Retained log launch limit');
+    this.maxRetainedSnapshots = positiveInteger(options.maxRetainedSnapshots ?? DEFAULT_RETAINED_SNAPSHOTS, 'Retained snapshot limit');
     this.now = options.now ?? (() => new Date());
     this.onState = options.onState ?? (() => {});
     this.onOutput = options.onOutput ?? (() => {});
@@ -88,15 +105,32 @@ export class ProcessSupervisor {
     return [...this.snapshots.values()].map(cloneSnapshot);
   }
 
+  forget(processId: string): boolean {
+    if (this.runtimes.has(processId)) {
+      throw new ProcessSupervisorError('PROCESS_ALREADY_MANAGED', `Cannot forget process ${processId} while ownership is active.`);
+    }
+    return this.snapshots.delete(processId);
+  }
+
+  getTransport(processId: string): ManagedProcessTransport {
+    this.assertOpen();
+    const runtime = this.runtimes.get(processId);
+    if (!runtime?.transport) {
+      throw new ProcessSupervisorError('PROCESS_NOT_FOUND', `Process ${processId} does not expose raw pipe transport.`);
+    }
+    return runtime.transport;
+  }
+
   start(spec: ManagedProcessSpec): Promise<ManagedProcessSnapshot> {
     this.assertOpen();
-    return this.enqueue(spec.id, () => this.startLocked(normalizeSpec(spec)));
+    const normalized = normalizeSpec(spec);
+    return this.runOwned(() => this.startLocked(normalized));
   }
 
   restart(spec: ManagedProcessSpec): Promise<ManagedProcessSnapshot> {
     this.assertOpen();
-    return this.enqueue(spec.id, async () => {
-      const normalized = normalizeSpec(spec);
+    const normalized = normalizeSpec(spec);
+    return this.runOwned(async () => {
       if (this.runtimes.has(normalized.id)) await this.stopLocked(normalized.id);
       return this.startLocked(normalized);
     });
@@ -104,12 +138,12 @@ export class ProcessSupervisor {
 
   stop(processId: string): Promise<ManagedProcessSnapshot> {
     this.assertOpen();
-    return this.enqueue(processId, () => this.stopLocked(processId));
+    return this.runOwned(() => this.stopLocked(processId));
   }
 
-  async reconcile(): Promise<ReconciliationResult> {
+  reconcile(): Promise<ReconciliationResult> {
     this.assertOpen();
-    return reconcileProcessRecords({
+    return this.runOwned(() => reconcileProcessRecords({
       recordStore: this.recordStore,
       platform: this.platform,
       isAlreadyManaged: (processId) => this.runtimes.has(processId),
@@ -118,10 +152,11 @@ export class ProcessSupervisor {
         const runtime = await adoptProcess(record, this.runtimeContext());
         this.runtimes.set(record.id, runtime);
         this.publish(snapshotFromRecord(record, 'running', 'adopted', null));
-        this.scheduleMonitor(runtime);
+        this.scheduleMonitor();
       },
+      onRecordRemoved: (record) => this.pruneRecordLogs(record),
       publish: (snapshot) => this.publish(snapshot),
-    });
+    }));
   }
 
   async readOutputTail(
@@ -137,17 +172,13 @@ export class ProcessSupervisor {
   }
 
   close(): Promise<void> {
-    if (this.closing) return this.closing;
-    this.closing = this.closeInternal();
-    return this.closing;
+    if (this.closed) return Promise.resolve();
+    return this.coordinator.close(() => this.closeLocked());
   }
 
-  private async closeInternal(): Promise<void> {
+  private async closeLocked(): Promise<void> {
     if (this.closed) return;
-    this.closed = true;
-
-    // Lifecycle operations accepted before close() must settle before ownership is released.
-    await Promise.allSettled([...this.lifecycleQueues.values()]);
+    this.clearMonitor();
 
     const errors: unknown[] = [];
     for (const processId of [...this.runtimes.keys()]) {
@@ -159,19 +190,23 @@ export class ProcessSupervisor {
         continue;
       }
       try {
-        await this.enqueue(processId, () => this.stopLocked(processId));
+        await this.stopLocked(processId);
       } catch (error) {
         errors.push(error);
       }
     }
 
     if (errors.length > 0) {
+      this.scheduleMonitor();
       throw new ProcessSupervisorError(
         'PROCESS_STOP_FAILED',
-        `Failed to stop ${errors.length} managed process${errors.length === 1 ? '' : 'es'} during close.`,
+        `Failed to stop ${errors.length} managed process${errors.length === 1 ? '' : 'es'} during close. Ownership was retained for retry.`,
         {cause: new AggregateError(errors)},
       );
     }
+
+    await this.releaseStateOwnership();
+    this.closed = true;
   }
 
   private async startLocked(spec: NormalizedProcessSpec): Promise<ManagedProcessSnapshot> {
@@ -200,18 +235,33 @@ export class ProcessSupervisor {
         spec,
         this.runtimeContext(),
         (child, code, signal) => {
-          void this.enqueue(spec.id, () => this.handleChildExitLocked(spec.id, child, code, signal));
+          void this.coordinator.runInternal(() => this.handleChildExitLocked(spec.id, child, code, signal));
         },
       );
       this.runtimes.set(spec.id, runtime);
       this.publish(snapshotFromRecord(runtime.record, 'running', 'started', null));
       return this.getSnapshot(spec.id)!;
     } catch (error) {
-      this.runtimes.delete(spec.id);
+      if (error instanceof ProcessLaunchFailure && error.residualRuntime) {
+        const runtime = error.residualRuntime;
+        this.runtimes.set(spec.id, runtime);
+        this.publish({
+          ...snapshotFromRecord(runtime.record, 'unresolved', 'started', null),
+          error: `Launch failed and residual cleanup failed. Ownership was retained${error.recordPersisted ? '' : ' in memory only'}: ${messageOf(error.cleanupError)}`,
+        });
+        throw new ProcessSupervisorError(
+          'PROCESS_START_FAILED',
+          `Failed to start process ${spec.id}; residual ownership is retained for explicit cleanup.`,
+          {cause: error},
+        );
+      }
+
       this.publish({
         ...startingSnapshot(spec),
-        state: 'crashed',
-        error: `Failed to start managed process: ${messageOf(error)}`,
+        state: error instanceof ProcessLaunchFailure ? 'unresolved' : 'crashed',
+        error: error instanceof ProcessLaunchFailure
+          ? `Failed to start managed process and cleanup could not be proven: ${messageOf(error.cleanupError)}`
+          : `Failed to start managed process: ${messageOf(error)}`,
       });
       throw new ProcessSupervisorError(
         'PROCESS_START_FAILED',
@@ -229,7 +279,12 @@ export class ProcessSupervisor {
       throw new ProcessSupervisorError('PROCESS_NOT_FOUND', `Process ${processId} is not managed.`);
     }
 
-    if (runtime.child && (runtime.child.exitCode !== null || runtime.child.signalCode !== null)) {
+    const current = this.snapshotFor(runtime);
+    if (
+      runtime.child
+      && current.state !== 'unresolved'
+      && (runtime.child.exitCode !== null || runtime.child.signalCode !== null)
+    ) {
       return this.handleChildExitLocked(
         processId,
         runtime.child,
@@ -239,49 +294,41 @@ export class ProcessSupervisor {
     }
 
     runtime.expectedStop = true;
-    this.publish({...this.snapshotFor(runtime), state: 'stopping', error: null, forcedTermination: false});
+    this.publish({...current, state: 'stopping', error: null, forcedTermination: false});
 
     try {
       let forced = false;
-      if (runtime.child) {
-        forced = await terminateKnownProcessGroup(
+      if (runtime.child && runtime.child.exitCode === null && runtime.child.signalCode === null) {
+        forced = await terminateKnownProcessScope(
           this.platform,
-          runtime.record.processGroupId,
+          runtime.record.scope,
           this.gracefulShutdownMs,
           this.forcedShutdownMs,
           this.groupPollMs,
         );
       } else {
-        const inspection = await this.platform.inspect(runtime.record.pid);
-        if (inspection && !identityMatches(runtime.record, inspection)) {
-          await this.recordStore.remove(processId);
-          releaseRuntime(runtime);
-          this.runtimes.delete(processId);
-          const snapshot = {
-            ...snapshotFromRecord(runtime.record, 'crashed', null, null),
-            error: 'Live PID no longer matches the recorded process identity. Ownership was discarded without signalling it.',
-          };
-          this.publish(snapshot);
+        const probes = await this.platform.probeMany([runtime.record.pid]);
+        const probe = probes.get(runtime.record.pid);
+        if (probe && !identityMatches(runtime.record, probe)) {
+          await this.discardUnsafeIdentity(runtime, 'Live PID no longer matches the recorded stable process identity.');
           throw new ProcessSupervisorError(
             'PROCESS_IDENTITY_MISMATCH',
             `Process ${processId} no longer matches its recorded identity.`,
           );
         }
-
-        if (inspection) {
-          forced = await terminateKnownProcessGroup(
-            this.platform,
-            runtime.record.processGroupId,
-            this.gracefulShutdownMs,
-            this.forcedShutdownMs,
-            this.groupPollMs,
-          );
-        }
+        forced = await terminateKnownProcessScope(
+          this.platform,
+          runtime.record.scope,
+          this.gracefulShutdownMs,
+          this.forcedShutdownMs,
+          this.groupPollMs,
+        );
       }
 
       await this.recordStore.remove(processId);
       releaseRuntime(runtime);
       this.runtimes.delete(processId);
+      await this.pruneRecordLogs(runtime.record);
       const previous = this.snapshots.get(processId);
       const stopped: ManagedProcessSnapshot = {
         ...snapshotFromRecord(runtime.record, 'stopped', null, null),
@@ -294,11 +341,14 @@ export class ProcessSupervisor {
     } catch (error) {
       runtime.expectedStop = false;
       if (error instanceof ProcessSupervisorError && error.code === 'PROCESS_IDENTITY_MISMATCH') throw error;
-      this.publish({
-        ...this.snapshotFor(runtime),
-        state: 'crashed',
-        error: `Failed to stop managed process: ${messageOf(error)}`,
-      });
+      if (this.runtimes.get(processId) === runtime) {
+        this.publish({
+          ...snapshotFromRecord(runtime.record, 'unresolved', runtime.child ? 'started' : 'adopted', null),
+          lastExitCode: current.lastExitCode,
+          lastSignal: current.lastSignal,
+          error: `Failed to stop managed process; ownership was retained for retry: ${messageOf(error)}`,
+        });
+      }
       throw new ProcessSupervisorError(
         'PROCESS_STOP_FAILED',
         `Failed to stop process ${processId}: ${messageOf(error)}`,
@@ -322,104 +372,172 @@ export class ProcessSupervisor {
     if (runtime.expectedStop || current.state === 'stopping') return current;
 
     const detail = code !== null ? ` with code ${code}` : signal ? ` from ${signal}` : '';
-    this.publish({
-      ...this.snapshotFor(runtime),
-      state: 'crashed',
-      pid: null,
-      startedAt: null,
-      lastExitCode: code,
-      lastSignal: signal,
-      error: `Managed process exited unexpectedly${detail}.`,
-    });
+    try {
+      await terminateKnownProcessScope(
+        this.platform,
+        runtime.record.scope,
+        this.gracefulShutdownMs,
+        this.forcedShutdownMs,
+        this.groupPollMs,
+      );
+    } catch (error) {
+      const unresolved = {
+        ...snapshotFromRecord(runtime.record, 'unresolved', 'started', null),
+        lastExitCode: code,
+        lastSignal: signal,
+        error: `Managed process exited unexpectedly${detail}; residual scope cleanup failed and ownership was retained: ${messageOf(error)}`,
+      };
+      this.publish(unresolved);
+      return cloneSnapshot(unresolved);
+    }
 
-    await terminateKnownProcessGroup(
-      this.platform,
-      runtime.record.processGroupId,
-      this.gracefulShutdownMs,
-      this.forcedShutdownMs,
-      this.groupPollMs,
-    ).catch(() => undefined);
-    await this.recordStore.remove(processId).catch(() => undefined);
+    try {
+      await this.recordStore.remove(processId);
+    } catch (error) {
+      const unresolved = {
+        ...snapshotFromRecord(runtime.record, 'unresolved', 'started', null),
+        lastExitCode: code,
+        lastSignal: signal,
+        error: `Managed process exited unexpectedly${detail}; cleanup succeeded but durable ownership could not be cleared: ${messageOf(error)}`,
+      };
+      this.publish(unresolved);
+      return cloneSnapshot(unresolved);
+    }
+
     releaseRuntime(runtime);
     this.runtimes.delete(processId);
+    await this.pruneRecordLogs(runtime.record);
     const crashed = {
       ...this.snapshotForRecordWithExit(runtime.record, code, signal),
-      processGroupId: null,
       error: `Managed process exited unexpectedly${detail}.`,
     };
     this.publish(crashed);
     return cloneSnapshot(crashed);
   }
 
-  private scheduleMonitor(runtime: RuntimeProcess): void {
-    if (runtime.child || runtime.monitorTimer || this.closed) return;
-    runtime.monitorTimer = setTimeout(() => {
-      runtime.monitorTimer = null;
-      void this.monitorAdopted(runtime);
+  private scheduleMonitor(): void {
+    if (this.monitorTimer || this.closed || !this.hasAdoptedRuntimes()) return;
+    this.monitorTimer = setTimeout(() => {
+      this.monitorTimer = null;
+      void this.coordinator.runInternal(() => this.monitorAdoptedBatchLocked());
     }, this.monitorPollMs);
-    runtime.monitorTimer.unref();
+    this.monitorTimer.unref();
   }
 
-  private async monitorAdopted(runtime: RuntimeProcess): Promise<void> {
-    if (this.runtimes.get(runtime.record.id) !== runtime || this.closed) return;
+  private clearMonitor(): void {
+    if (this.monitorTimer) clearTimeout(this.monitorTimer);
+    this.monitorTimer = null;
+  }
+
+  private async monitorAdoptedBatchLocked(): Promise<void> {
+    if (this.closed) return;
+    const runtimes = [...this.runtimes.values()].filter((runtime) => runtime.child === null);
+    if (runtimes.length === 0) return;
+
+    let probes;
     try {
-      const inspection = await this.platform.inspect(runtime.record.pid);
-      if (inspection === null) {
-        await this.enqueue(runtime.record.id, async () => {
-          if (this.runtimes.get(runtime.record.id) !== runtime) return this.snapshotFor(runtime);
-          await this.recordStore.remove(runtime.record.id).catch(() => undefined);
-          releaseRuntime(runtime);
-          this.runtimes.delete(runtime.record.id);
-          const crashed = {
-            ...snapshotFromRecord(runtime.record, 'crashed', null, null),
-            error: 'Adopted process exited after recovery.',
-          };
-          this.publish(crashed);
-          return crashed;
-        });
-        return;
-      }
-
-      if (!identityMatches(runtime.record, inspection)) {
-        await this.enqueue(runtime.record.id, async () => {
-          if (this.runtimes.get(runtime.record.id) !== runtime) return this.snapshotFor(runtime);
-          await this.recordStore.remove(runtime.record.id).catch(() => undefined);
-          releaseRuntime(runtime);
-          this.runtimes.delete(runtime.record.id);
-          const crashed = {
-            ...snapshotFromRecord(runtime.record, 'crashed', null, null),
-            error: 'Adopted PID no longer matches the recorded process identity. Ownership was discarded without signalling it.',
-          };
-          this.publish(crashed);
-          return crashed;
-        });
-        return;
-      }
-
-      const snapshot = this.snapshots.get(runtime.record.id);
-      if (snapshot?.error) this.publish({...snapshot, error: null});
+      probes = await this.platform.probeMany(runtimes.map((runtime) => runtime.record.pid));
     } catch (error) {
-      const snapshot = this.snapshots.get(runtime.record.id);
-      if (snapshot?.state === 'running') {
-        this.publish({...snapshot, error: `Process inspection failed: ${messageOf(error)}`});
+      for (const runtime of runtimes) {
+        if (this.runtimes.get(runtime.record.id) !== runtime) continue;
+        this.publish({
+          ...snapshotFromRecord(runtime.record, 'unresolved', 'adopted', null),
+          error: `Process inspection failed; ownership was retained: ${messageOf(error)}`,
+        });
       }
-    } finally {
-      if (this.runtimes.get(runtime.record.id) === runtime) this.scheduleMonitor(runtime);
+      this.scheduleMonitor();
+      return;
     }
+
+    for (const runtime of runtimes) {
+      if (this.runtimes.get(runtime.record.id) !== runtime) continue;
+      const probe = probes.get(runtime.record.pid);
+      if (!probe) {
+        await this.handleAdoptedExitLocked(runtime);
+        continue;
+      }
+
+      if (!identityMatches(runtime.record, probe)) {
+        try {
+          await this.discardUnsafeIdentity(runtime, 'Adopted PID now belongs to a different stable process identity.');
+        } catch (error) {
+          this.publish({
+            ...snapshotFromRecord(runtime.record, 'unresolved', 'adopted', null),
+            error: `Process identity became unsafe and durable ownership cleanup failed: ${messageOf(error)}`,
+          });
+        }
+        continue;
+      }
+
+      const snapshot = this.snapshots.get(runtime.record.id);
+      if (snapshot?.state !== 'running' || snapshot.error) {
+        this.publish(snapshotFromRecord(runtime.record, 'running', 'adopted', null));
+      }
+    }
+
+    this.scheduleMonitor();
+  }
+
+  private async handleAdoptedExitLocked(runtime: RuntimeProcess): Promise<void> {
+    try {
+      await terminateKnownProcessScope(
+        this.platform,
+        runtime.record.scope,
+        this.gracefulShutdownMs,
+        this.forcedShutdownMs,
+        this.groupPollMs,
+      );
+      await this.recordStore.remove(runtime.record.id);
+    } catch (error) {
+      this.publish({
+        ...snapshotFromRecord(runtime.record, 'unresolved', 'adopted', null),
+        error: `Adopted process exited, but residual cleanup could not be proven. Ownership was retained: ${messageOf(error)}`,
+      });
+      return;
+    }
+
+    releaseRuntime(runtime);
+    this.runtimes.delete(runtime.record.id);
+    await this.pruneRecordLogs(runtime.record);
+    this.publish({
+      ...snapshotFromRecord(runtime.record, 'crashed', null, null),
+      error: 'Adopted process exited after recovery.',
+    });
+  }
+
+  private async discardUnsafeIdentity(runtime: RuntimeProcess, reason: string): Promise<void> {
+    let removalError: unknown | null = null;
+    try {
+      await this.recordStore.remove(runtime.record.id);
+    } catch (error) {
+      removalError = error;
+    }
+
+    releaseRuntime(runtime);
+    this.runtimes.delete(runtime.record.id);
+    if (!removalError) await this.pruneRecordLogs(runtime.record);
+    this.publish({
+      ...snapshotFromRecord(runtime.record, 'unresolved', null, null),
+      pid: null,
+      scope: null,
+      startedAt: null,
+      error: removalError ? `${reason} ${messageOf(removalError)}` : reason,
+    });
+    if (removalError) throw removalError;
   }
 
   private async terminateVerifiedRecord(record: DurableProcessRecord): Promise<void> {
-    const inspection = await this.platform.inspect(record.pid);
-    if (!inspection) return;
-    if (!identityMatches(record, inspection)) {
+    const probes = await this.platform.probeMany([record.pid]);
+    const probe = probes.get(record.pid);
+    if (probe && !identityMatches(record, probe)) {
       throw new ProcessSupervisorError(
         'PROCESS_IDENTITY_MISMATCH',
         `Process ${record.id} no longer matches its recorded identity.`,
       );
     }
-    await terminateKnownProcessGroup(
+    await terminateKnownProcessScope(
       this.platform,
-      record.processGroupId,
+      record.scope,
       this.gracefulShutdownMs,
       this.forcedShutdownMs,
       this.groupPollMs,
@@ -435,13 +553,15 @@ export class ProcessSupervisor {
       forcedShutdownMs: this.forcedShutdownMs,
       groupPollMs: this.groupPollMs,
       logPollMs: this.logPollMs,
+      maxRetainedLogLaunches: this.maxRetainedLogLaunches,
       now: this.now,
       onOutput: this.onOutput,
     };
   }
 
   private snapshotFor(runtime: RuntimeProcess): ManagedProcessSnapshot {
-    return this.getSnapshot(runtime.record.id) ?? snapshotFromRecord(runtime.record, 'running', runtime.child ? 'started' : 'adopted', null);
+    return this.getSnapshot(runtime.record.id)
+      ?? snapshotFromRecord(runtime.record, 'running', runtime.child ? 'started' : 'adopted', null);
   }
 
   private snapshotForRecordWithExit(
@@ -458,7 +578,9 @@ export class ProcessSupervisor {
 
   private publish(snapshot: ManagedProcessSnapshot): void {
     const copy = cloneSnapshot(snapshot);
+    this.snapshots.delete(snapshot.id);
     this.snapshots.set(snapshot.id, copy);
+    this.evictSnapshots();
     try {
       this.onState({processId: snapshot.id, snapshot: cloneSnapshot(copy)});
     } catch {
@@ -466,18 +588,52 @@ export class ProcessSupervisor {
     }
   }
 
-  private enqueue<T>(processId: string, operation: () => Promise<T>): Promise<T> {
-    const previous = this.lifecycleQueues.get(processId) ?? Promise.resolve();
-    const result = previous.then(operation, operation);
-    const settled = result.then(() => undefined, () => undefined);
-    this.lifecycleQueues.set(processId, settled);
-    void settled.finally(() => {
-      if (this.lifecycleQueues.get(processId) === settled) this.lifecycleQueues.delete(processId);
+  private evictSnapshots(): void {
+    while (this.snapshots.size > this.maxRetainedSnapshots) {
+      const candidate = [...this.snapshots.entries()].find(([processId, snapshot]) => {
+        if (this.runtimes.has(processId)) return false;
+        return snapshot.state !== 'starting' && snapshot.state !== 'running' && snapshot.state !== 'stopping';
+      });
+      if (!candidate) return;
+      this.snapshots.delete(candidate[0]);
+    }
+  }
+
+  private async pruneRecordLogs(record: DurableProcessRecord): Promise<void> {
+    if (!record.logs) return;
+    await pruneDurableLogs(this.options.stateDirectory, record.id, this.maxRetainedLogLaunches).catch(() => undefined);
+  }
+
+  private hasAdoptedRuntimes(): boolean {
+    return [...this.runtimes.values()].some((runtime) => runtime.child === null);
+  }
+
+  private runOwned<T>(operation: () => Promise<T>): Promise<T> {
+    return this.coordinator.run(async () => {
+      await this.ensureStateOwnership();
+      return operation();
     });
-    return result;
+  }
+
+  private async ensureStateOwnership(): Promise<void> {
+    if (!this.stateLock) return;
+    this.stateOwnership ??= this.stateLock.acquire().catch((error) => {
+      this.stateOwnership = null;
+      throw error;
+    });
+    await this.stateOwnership;
+  }
+
+  private async releaseStateOwnership(): Promise<void> {
+    if (!this.stateLock || !this.stateOwnership) return;
+    await this.stateOwnership;
+    await this.stateLock.release();
+    this.stateOwnership = null;
   }
 
   private assertOpen(): void {
-    if (this.closed) throw new ProcessSupervisorError('PROCESS_STOP_FAILED', 'Process supervisor is closed.');
+    if (this.closed || !this.coordinator.isAccepting) {
+      throw new ProcessSupervisorError('PROCESS_STOP_FAILED', 'Process supervisor is closed or closing.');
+    }
   }
 }

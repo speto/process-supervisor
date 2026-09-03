@@ -1,15 +1,20 @@
+import type {ChildProcess, StdioOptions} from 'node:child_process';
+import type {Readable, Writable} from 'node:stream';
+
 export type ManagedProcessState =
   | 'stopped'
   | 'starting'
   | 'running'
   | 'stopping'
-  | 'crashed';
+  | 'crashed'
+  | 'unresolved';
 
 export type ManagedProcessOrigin = 'started' | 'adopted';
 export type ManagedProcessOutputStream = 'stdout' | 'stderr';
-export type ProcessIoMode = 'pipe' | 'durable-log';
+export type ProcessIoMode = 'line' | 'pipe' | 'durable-log';
 export type ProcessRecoveryPolicy = 'terminate' | 'adopt';
 export type ProcessShutdownPolicy = 'terminate' | 'preserve';
+export type ProcessTerminationMode = 'graceful' | 'force';
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | readonly JsonValue[] | {readonly [key: string]: JsonValue};
@@ -33,16 +38,40 @@ export interface ManagedProcessSpec {
   metadata?: Readonly<Record<string, JsonValue>>;
 }
 
-export interface ProcessIdentity {
-  startedAt: string;
-  commandFingerprint: string;
+export interface ProcessScope {
+  kind: string;
+  id: string;
 }
 
-export interface ProcessInspection {
+export interface ProcessIdentity {
+  startedAt: string;
+  stableId: string;
+  commandFingerprint?: string;
+}
+
+export interface ProcessProbe {
   pid: number;
-  processGroupId: number;
+  scope: ProcessScope;
+  stableId: string;
+}
+
+export interface ProcessInspection extends ProcessProbe {
   startedAt: string;
   commandLine: string;
+}
+
+export interface ProcessSpawnRequest {
+  executable: string;
+  args: readonly string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  stdio: StdioOptions;
+}
+
+export interface ManagedProcessTransport {
+  stdin: Writable;
+  stdout: Readable;
+  stderr: Readable;
 }
 
 export interface DurableProcessLogs {
@@ -51,10 +80,10 @@ export interface DurableProcessLogs {
 }
 
 export interface DurableProcessRecord {
-  schemaVersion: 1;
+  schemaVersion: 2;
   id: string;
   pid: number;
-  processGroupId: number;
+  scope: ProcessScope;
   executable: string;
   cwd: string;
   ioMode: ProcessIoMode;
@@ -71,7 +100,7 @@ export interface ManagedProcessSnapshot {
   state: ManagedProcessState;
   origin: ManagedProcessOrigin | null;
   pid: number | null;
-  processGroupId: number | null;
+  scope: ProcessScope | null;
   startedAt: string | null;
   lastExitCode: number | null;
   lastSignal: NodeJS.Signals | null;
@@ -106,9 +135,11 @@ export interface ProcessRecordStore {
 }
 
 export interface ProcessPlatform {
+  spawn(request: ProcessSpawnRequest): ChildProcess;
   inspect(pid: number): Promise<ProcessInspection | null>;
-  isProcessGroupAlive(processGroupId: number): Promise<boolean>;
-  signalProcessGroup(processGroupId: number, signal: NodeJS.Signals): Promise<void>;
+  probeMany(pids: readonly number[]): Promise<ReadonlyMap<number, ProcessProbe>>;
+  isScopeAlive(scope: ProcessScope): Promise<boolean>;
+  terminateScope(scope: ProcessScope, mode: ProcessTerminationMode): Promise<void>;
 }
 
 export interface ReconciliationIssue {
@@ -137,6 +168,8 @@ export interface ProcessSupervisorOptions {
   groupPollMs?: number;
   monitorPollMs?: number;
   logPollMs?: number;
+  maxRetainedLogLaunches?: number;
+  maxRetainedSnapshots?: number;
   now?: () => Date;
   onState?: (event: ManagedProcessStateEvent) => void;
   onOutput?: (event: ManagedProcessOutputEvent) => void;

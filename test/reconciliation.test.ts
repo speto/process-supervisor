@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import {mkdtemp, rm} from 'node:fs/promises';
+import {appendFile, mkdtemp, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {spawn} from 'node:child_process';
+import {spawn, type ChildProcess} from 'node:child_process';
 import {once} from 'node:events';
 import {test} from 'node:test';
 import {
@@ -12,8 +12,12 @@ import {
   type ManagedProcessOutputEvent,
   type ProcessInspection,
   type ProcessPlatform,
+  type ProcessProbe,
   type ProcessRecordEntry,
   type ProcessRecordStore,
+  type ProcessScope,
+  type ProcessSpawnRequest,
+  type ProcessTerminationMode,
 } from '../src/index.js';
 
 class MemoryRecordStore implements ProcessRecordStore {
@@ -42,32 +46,46 @@ class MemoryRecordStore implements ProcessRecordStore {
 }
 
 class FakePlatform implements ProcessPlatform {
-  readonly signals: Array<{processGroupId: number; signal: NodeJS.Signals}> = [];
+  readonly terminations: Array<{scope: ProcessScope; mode: ProcessTerminationMode}> = [];
   inspection: ProcessInspection | null = null;
   inspectionError: Error | null = null;
-  groupAlive = true;
+  scopeAlive = true;
+  inspectGate: Promise<void> | null = null;
+  inspectStarted: (() => void) | null = null;
+
+  spawn(_request: ProcessSpawnRequest): ChildProcess {
+    throw new Error('FakePlatform.spawn is not used by these tests.');
+  }
 
   async inspect(): Promise<ProcessInspection | null> {
+    this.inspectStarted?.();
+    if (this.inspectGate) await this.inspectGate;
     if (this.inspectionError) throw this.inspectionError;
     return this.inspection;
   }
 
-  async isProcessGroupAlive(): Promise<boolean> {
-    return this.groupAlive;
+  async probeMany(pids: readonly number[]): Promise<ReadonlyMap<number, ProcessProbe>> {
+    if (this.inspectionError) throw this.inspectionError;
+    if (!this.inspection || !pids.includes(this.inspection.pid)) return new Map();
+    return new Map([[this.inspection.pid, probeOf(this.inspection)]]);
   }
 
-  async signalProcessGroup(processGroupId: number, signal: NodeJS.Signals): Promise<void> {
-    this.signals.push({processGroupId, signal});
-    this.groupAlive = false;
+  async isScopeAlive(): Promise<boolean> {
+    return this.scopeAlive;
+  }
+
+  async terminateScope(scope: ProcessScope, mode: ProcessTerminationMode): Promise<void> {
+    this.terminations.push({scope, mode});
+    this.scopeAlive = false;
   }
 }
 
-function record(): DurableProcessRecord {
+function record(overrides: Partial<DurableProcessRecord> = {}): DurableProcessRecord {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: 'owned',
     pid: 123,
-    processGroupId: 123,
+    scope: {kind: 'test-scope', id: '123'},
     executable: '/usr/bin/example',
     cwd: '/tmp',
     ioMode: 'durable-log',
@@ -75,6 +93,7 @@ function record(): DurableProcessRecord {
     shutdownPolicy: 'preserve',
     identity: {
       startedAt: '2026-09-02T20:00:00.000Z',
+      stableId: 'test:boot:123',
       commandFingerprint: 'a'.repeat(64),
     },
     logs: {
@@ -83,9 +102,24 @@ function record(): DurableProcessRecord {
     },
     createdAt: '2026-09-02T20:00:00.000Z',
     metadata: {},
+    ...overrides,
   };
 }
 
+function inspection(overrides: Partial<ProcessInspection> = {}): ProcessInspection {
+  return {
+    pid: 123,
+    scope: {kind: 'test-scope', id: '123'},
+    stableId: 'test:boot:123',
+    startedAt: '2026-09-02T20:00:00.000Z',
+    commandLine: '/usr/bin/example',
+    ...overrides,
+  };
+}
+
+function probeOf(value: ProcessInspection): ProcessProbe {
+  return {pid: value.pid, scope: value.scope, stableId: value.stableId};
+}
 
 test('refuses to overwrite unreconciled durable ownership state', async () => {
   const store = new MemoryRecordStore([record()]);
@@ -110,15 +144,10 @@ test('refuses to overwrite unreconciled durable ownership state', async () => {
   await supervisor.close();
 });
 
-test('never signals a reused PID whose identity no longer matches', async () => {
+test('never signals a reused PID whose stable identity no longer matches', async () => {
   const store = new MemoryRecordStore([record()]);
   const platform = new FakePlatform();
-  platform.inspection = {
-    pid: 123,
-    processGroupId: 123,
-    startedAt: '2026-09-02T20:00:01.000Z',
-    commandLine: '/usr/bin/unrelated',
-  };
+  platform.inspection = inspection({stableId: 'test:boot:reused', commandLine: '/usr/bin/unrelated'});
   const supervisor = new ProcessSupervisor({
     stateDirectory: '/tmp/process-supervisor-test-state',
     recordStore: store,
@@ -127,9 +156,36 @@ test('never signals a reused PID whose identity no longer matches', async () => 
 
   const result = await supervisor.reconcile();
   assert.equal(result.stale, 1);
-  assert.equal(platform.signals.length, 0);
+  assert.equal(platform.terminations.length, 0);
   assert.equal(store.records.size, 0);
+  assert.equal(supervisor.getSnapshot('owned')?.state, 'unresolved');
   await supervisor.close();
+});
+
+test('does not treat a mutable command line as process identity', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'process-supervisor-command-identity-'));
+  const stdoutPath = join(root, 'stdout.log');
+  const stderrPath = join(root, 'stderr.log');
+  await Promise.all([writeFile(stdoutPath, ''), writeFile(stderrPath, '')]);
+  const store = new MemoryRecordStore([record({logs: {stdoutPath, stderrPath}})]);
+  const platform = new FakePlatform();
+  platform.inspection = inspection({commandLine: 'changed-title'});
+  const supervisor = new ProcessSupervisor({
+    stateDirectory: root,
+    recordStore: store,
+    platform,
+    monitorPollMs: 60_000,
+  });
+
+  try {
+    const result = await supervisor.reconcile();
+    assert.equal(result.adopted, 1);
+    assert.equal(result.stale, 0);
+    assert.equal(supervisor.getSnapshot('owned')?.state, 'running');
+  } finally {
+    await supervisor.close();
+    await rm(root, {recursive: true, force: true});
+  }
 });
 
 test('keeps ownership unresolved when process inspection fails', async () => {
@@ -144,9 +200,83 @@ test('keeps ownership unresolved when process inspection fails', async () => {
 
   const result = await supervisor.reconcile();
   assert.equal(result.unresolved, 1);
-  assert.equal(platform.signals.length, 0);
+  assert.equal(platform.terminations.length, 0);
   assert.equal(store.records.size, 1);
   await supervisor.close();
+});
+
+test('serializes concurrent reconciliation and creates one durable-log follower set', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'process-supervisor-reconcile-once-'));
+  const stdoutPath = join(root, 'stdout.log');
+  const stderrPath = join(root, 'stderr.log');
+  await Promise.all([writeFile(stdoutPath, ''), writeFile(stderrPath, '')]);
+  const store = new MemoryRecordStore([record({logs: {stdoutPath, stderrPath}})]);
+  const platform = new FakePlatform();
+  platform.inspection = inspection();
+  const output: ManagedProcessOutputEvent[] = [];
+  const supervisor = new ProcessSupervisor({
+    stateDirectory: root,
+    recordStore: store,
+    platform,
+    monitorPollMs: 60_000,
+    logPollMs: 10,
+    onOutput: (event) => output.push(event),
+  });
+
+  try {
+    const results = await Promise.all([supervisor.reconcile(), supervisor.reconcile()]);
+    assert.equal(results.reduce((sum, result) => sum + result.adopted, 0), 1);
+
+    await appendFile(stdoutPath, 'only-once\n');
+    await waitFor(() => output.filter((event) => event.line === 'only-once').length === 1 ? true : undefined, 2_000);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(output.filter((event) => event.line === 'only-once').length, 1);
+  } finally {
+    await supervisor.close();
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test('close waits for in-flight reconciliation and cannot finish before ownership is resolved', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'process-supervisor-close-reconcile-'));
+  const stdoutPath = join(root, 'stdout.log');
+  const stderrPath = join(root, 'stderr.log');
+  await Promise.all([writeFile(stdoutPath, ''), writeFile(stderrPath, '')]);
+  const store = new MemoryRecordStore([record({
+    logs: {stdoutPath, stderrPath},
+    shutdownPolicy: 'terminate',
+  })]);
+  const platform = new FakePlatform();
+  platform.inspection = inspection();
+  let releaseInspection!: () => void;
+  let inspectionStarted!: () => void;
+  const started = new Promise<void>((resolve) => { inspectionStarted = resolve; });
+  platform.inspectStarted = inspectionStarted;
+  platform.inspectGate = new Promise<void>((resolve) => { releaseInspection = resolve; });
+  const supervisor = new ProcessSupervisor({
+    stateDirectory: root,
+    recordStore: store,
+    platform,
+    monitorPollMs: 60_000,
+    logPollMs: 10,
+  });
+
+  try {
+    const reconciliation = supervisor.reconcile();
+    await started;
+    const closing = supervisor.close();
+    releaseInspection();
+
+    assert.equal((await reconciliation).adopted, 1);
+    await closing;
+    assert.equal(store.records.size, 0);
+    assert.equal(supervisor.getSnapshot('owned')?.state, 'stopped');
+    assert.equal(platform.terminations.length, 1);
+  } finally {
+    releaseInspection();
+    await supervisor.close();
+    await rm(root, {recursive: true, force: true});
+  }
 });
 
 test('adopts a durable process after supervisor crash and resumes logs and control', async () => {

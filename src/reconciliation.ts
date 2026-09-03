@@ -15,6 +15,7 @@ export interface ReconciliationContext {
   isAlreadyManaged(processId: string): boolean;
   terminate(record: DurableProcessRecord): Promise<void>;
   adopt(record: DurableProcessRecord): Promise<void>;
+  onRecordRemoved(record: DurableProcessRecord): Promise<void>;
   publish(snapshot: ManagedProcessSnapshot): void;
 }
 
@@ -57,17 +58,20 @@ export async function reconcileProcessRecords(
 
     if (inspection === null) {
       dead += 1;
-      await context.recordStore.remove(record.id);
+      await removeRecord(context, record);
       context.publish(snapshotFromRecord(record, 'stopped', null, null));
       continue;
     }
 
     if (!identityMatches(record, inspection)) {
       stale += 1;
-      await context.recordStore.remove(record.id);
+      await removeRecord(context, record);
       context.publish({
-        ...snapshotFromRecord(record, 'crashed', null, null),
-        error: 'Recorded process identity no longer matches the live PID. Ownership was discarded without signalling it.',
+        ...snapshotFromRecord(record, 'unresolved', null, null),
+        pid: null,
+        scope: null,
+        startedAt: null,
+        error: 'Recorded PID now belongs to a different process identity. Ownership was discarded without signalling it.',
       });
       continue;
     }
@@ -76,7 +80,7 @@ export async function reconcileProcessRecords(
       try {
         await context.terminate(record);
         terminated += 1;
-        await context.recordStore.remove(record.id);
+        await removeRecord(context, record);
         context.publish(snapshotFromRecord(record, 'stopped', null, null));
       } catch (error) {
         unresolved += 1;
@@ -95,4 +99,9 @@ export async function reconcileProcessRecords(
   }
 
   return {checked, dead, stale, adopted, terminated, unresolved, invalid, issues};
+}
+
+async function removeRecord(context: ReconciliationContext, record: DurableProcessRecord): Promise<void> {
+  await context.recordStore.remove(record.id);
+  await context.onRecordRemoved(record);
 }

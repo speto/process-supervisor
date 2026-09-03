@@ -10,7 +10,9 @@ import type {
   ManagedProcessSpec,
   ProcessInspection,
   ProcessIoMode,
+  ProcessProbe,
   ProcessRecoveryPolicy,
+  ProcessScope,
   ProcessShutdownPolicy,
 } from './types.js';
 
@@ -39,10 +41,10 @@ export function normalizeSpec(spec: ManagedProcessSpec): NormalizedProcessSpec {
     throw new ProcessSupervisorError('INVALID_SPEC', 'Managed process arguments must be an array of strings.');
   }
 
-  const ioMode = spec.ioMode ?? 'pipe';
+  const ioMode = spec.ioMode ?? 'line';
   const recoveryPolicy = spec.recoveryPolicy ?? 'terminate';
   const shutdownPolicy = spec.shutdownPolicy ?? 'terminate';
-  if (ioMode !== 'pipe' && ioMode !== 'durable-log') {
+  if (ioMode !== 'line' && ioMode !== 'pipe' && ioMode !== 'durable-log') {
     throw new ProcessSupervisorError('INVALID_SPEC', `Unsupported I/O mode: ${String(ioMode)}.`);
   }
   if (recoveryPolicy !== 'terminate' && recoveryPolicy !== 'adopt') {
@@ -103,7 +105,7 @@ export function startingSnapshot(spec: NormalizedProcessSpec): ManagedProcessSna
     state: 'starting',
     origin: null,
     pid: null,
-    processGroupId: null,
+    scope: null,
     startedAt: null,
     lastExitCode: null,
     lastSignal: null,
@@ -122,14 +124,14 @@ export function snapshotFromRecord(
   origin: ManagedProcessSnapshot['origin'],
   error: string | null,
 ): ManagedProcessSnapshot {
-  const running = state === 'running' || state === 'stopping';
+  const active = state === 'running' || state === 'stopping' || state === 'unresolved';
   return {
     id: record.id,
     state,
     origin,
-    pid: running ? record.pid : null,
-    processGroupId: running ? record.processGroupId : null,
-    startedAt: running ? record.identity.startedAt : null,
+    pid: active ? record.pid : null,
+    scope: active ? cloneScope(record.scope) : null,
+    startedAt: active ? record.identity.startedAt : null,
     lastExitCode: null,
     lastSignal: null,
     error,
@@ -147,7 +149,7 @@ export function emptySnapshot(processId: string): ManagedProcessSnapshot {
     state: 'stopped',
     origin: null,
     pid: null,
-    processGroupId: null,
+    scope: null,
     startedAt: null,
     lastExitCode: null,
     lastSignal: null,
@@ -163,19 +165,23 @@ export function emptySnapshot(processId: string): ManagedProcessSnapshot {
 export function identityFromInspection(inspection: ProcessInspection): DurableProcessRecord['identity'] {
   return {
     startedAt: inspection.startedAt,
+    stableId: inspection.stableId,
     commandFingerprint: commandFingerprint(inspection.commandLine),
   };
 }
 
-export function identityMatches(record: DurableProcessRecord, inspection: ProcessInspection): boolean {
-  return record.pid === inspection.pid
-    && record.processGroupId === inspection.processGroupId
-    && record.identity.startedAt === inspection.startedAt
-    && record.identity.commandFingerprint === commandFingerprint(inspection.commandLine);
+export function identityMatches(record: DurableProcessRecord, probe: ProcessProbe): boolean {
+  return record.pid === probe.pid
+    && scopeEquals(record.scope, probe.scope)
+    && record.identity.stableId === probe.stableId;
 }
 
 export function cloneSnapshot(snapshot: ManagedProcessSnapshot): ManagedProcessSnapshot {
-  return {...snapshot, metadata: cloneMetadata(snapshot.metadata)};
+  return {
+    ...snapshot,
+    scope: snapshot.scope ? cloneScope(snapshot.scope) : null,
+    metadata: cloneMetadata(snapshot.metadata),
+  };
 }
 
 export function cloneMetadata(
@@ -183,6 +189,14 @@ export function cloneMetadata(
 ): Readonly<Record<string, JsonValue>> {
   assertJsonValue(metadata, 'metadata');
   return JSON.parse(JSON.stringify(metadata)) as Record<string, JsonValue>;
+}
+
+function cloneScope(scope: ProcessScope): ProcessScope {
+  return {kind: scope.kind, id: scope.id};
+}
+
+function scopeEquals(left: ProcessScope, right: ProcessScope): boolean {
+  return left.kind === right.kind && left.id === right.id;
 }
 
 function assertJsonValue(value: unknown, path: string): asserts value is JsonValue {

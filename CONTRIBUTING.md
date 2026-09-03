@@ -6,10 +6,10 @@ For substantial changes to behavior or the public API, open an issue first so th
 
 ## Development
 
-Requires Node.js 22+ and a POSIX host for lifecycle integration tests.
+Requires Node.js 22+. The built-in lifecycle integration tests run on macOS and Linux.
 
 ```sh
-npm install
+npm ci
 npm run check
 ```
 
@@ -25,8 +25,9 @@ npm pack --dry-run --ignore-scripts
 
 Keep the dependency direction explicit:
 
-- `ProcessSupervisor` owns lifecycle orchestration;
-- `ProcessPlatform` owns operating-system inspection and signalling;
+- `ProcessSupervisor` owns lifecycle orchestration and state publication;
+- `OwnershipCoordinator` serializes ownership-changing operations;
+- `ProcessPlatform` owns operating-system process scopes, stable identity, launch, inspection, and termination;
 - `ProcessRecordStore` owns durable record persistence;
 - concrete filesystem and POSIX code stays behind those boundaries.
 
@@ -37,8 +38,9 @@ Prefer names from the process-supervision domain (`ProcessIdentity`, `ProcessRec
 ## Pull requests
 
 - Keep changes focused and reviewable.
-- Add or update tests for lifecycle and recovery behavior changes.
-- Preserve the fail-safe rule: never signal a recovered PID whose identity cannot be proven.
+- Add or update tests for lifecycle, concurrency, and recovery behavior changes.
+- Preserve the fail-safe rule: never terminate a recovered process whose stable identity cannot be proven.
+- Never discard durable ownership merely because cleanup failed; retain it for retry unless identity itself becomes unsafe.
 - Update the README for user-visible changes.
 - Preserve existing public API behavior unless a breaking change is intentional.
 - Validate locally before pushing; hosted CI is merge validation, not an interactive development loop.

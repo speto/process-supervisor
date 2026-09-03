@@ -7,10 +7,10 @@ import {FileProcessRecordStore, type DurableProcessRecord} from '../src/index.js
 
 function record(id: string): DurableProcessRecord {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id,
     pid: 123,
-    processGroupId: 123,
+    scope: {kind: 'posix-process-group', id: '123'},
     executable: '/usr/bin/example',
     cwd: '/tmp',
     ioMode: 'durable-log',
@@ -18,6 +18,7 @@ function record(id: string): DurableProcessRecord {
     shutdownPolicy: 'preserve',
     identity: {
       startedAt: '2026-09-02T20:00:00.000Z',
+      stableId: 'test:boot:123',
       commandFingerprint: 'a'.repeat(64),
     },
     logs: {
@@ -65,7 +66,7 @@ test('uses atomic replacement rather than leaving temporary records behind', asy
   const store = new FileProcessRecordStore(root);
   try {
     await store.save(record('atomic'));
-    await store.save({...record('atomic'), pid: 456, processGroupId: 456});
+    await store.save({...record('atomic'), pid: 456, scope: {kind: 'posix-process-group', id: '456'}});
     const entries = await store.list();
     assert.equal(entries.length, 1);
     if (entries[0]?.kind === 'valid') assert.equal(entries[0].record.pid, 456);
