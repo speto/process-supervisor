@@ -59,6 +59,7 @@ export async function launchProcess(
   let durableLogs: DurableLogFiles | null = null;
   let child: ChildProcess | null = null;
   let record: DurableProcessRecord | null = null;
+  let runtime: RuntimeProcess | null = null;
   let recordSaved = false;
 
   try {
@@ -105,7 +106,7 @@ export async function launchProcess(
     await context.recordStore.save(record);
     recordSaved = true;
 
-    const runtime = createRuntime(record, child, context);
+    runtime = createRuntime(record, child, context);
     if (durableLogs) {
       child.unref();
       await Promise.all(runtime.followers.map((follower) => follower.start(false)));
@@ -113,6 +114,7 @@ export async function launchProcess(
 
     return runtime;
   } catch (error) {
+    if (runtime) releaseRuntime(runtime);
     if (child?.pid) {
       const cleanup = await cleanupFailedLaunch(child, record, recordSaved, context);
       if (cleanup.error) {
