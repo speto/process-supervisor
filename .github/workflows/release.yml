@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: process-supervisor-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          expected="v${version}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package version ${version}; expected ${expected}." >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --prefer-offline --no-audit --no-fund
+
+      - name: Check
+        run: npm run check
+
+      - name: Pack npm tarball
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pack --ignore-scripts --json > pack.json
+          cat pack.json
+          tarball="$(node -e "const result=require('./pack.json'); if (!Array.isArray(result) || result.length !== 1) process.exit(1); process.stdout.write(result[0].filename)")"
+          expected="process-supervisor-${GITHUB_REF_NAME#v}.tgz"
+          if [[ "${tarball}" != "${expected}" ]]; then
+            echo "npm pack produced ${tarball}; expected ${expected}." >&2
+            exit 1
+          fi
+          echo "tarball=${tarball}" >> "${GITHUB_OUTPUT}"
+          rm pack.json
+
+      - name: Verify packed consumer artifact
+        run: node ./scripts/verify-package.mjs "${{ steps.pack.outputs.tarball }}"
+
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            is_draft="$(gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq '.isDraft')"
+            if [[ "${is_draft}" != "true" ]]; then
+              echo "Release ${GITHUB_REF_NAME} already exists and is published." >&2
+              exit 1
+            fi
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --draft \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
+
+      - name: Upload npm package asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" "${{ steps.pack.outputs.tarball }}" --repo "${GITHUB_REPOSITORY}" --clobber
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --draft=false

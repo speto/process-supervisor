@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize, ready_for_review]
+    paths:
+      - '.github/workflows/**'
+      - 'native/**'
+      - 'scripts/**'
+      - 'src/**'
+      - 'test/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig*.json'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: process-supervisor-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    if: ${{ github.event.pull_request.draft == false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: 24
+            mode: full
+          - os: ubuntu-latest
+            node: 22
+            mode: full
+          - os: macos-latest
+            node: 24
+            mode: full
+            package_verify: true
+          - os: windows-latest
+            node: 24
+            mode: portable
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --prefer-offline --no-audit --no-fund
+
+      - name: Check
+        if: matrix.mode == 'full'
+        run: npm run check
+
+      - name: Verify packed package
+        if: matrix.package_verify == true
+        run: npm run package:verify
+
+      - name: Build Windows-portable package
+        if: matrix.mode == 'portable'
+        run: npm run build
+
+      - name: Verify Windows runtime import
+        if: matrix.mode == 'portable'
+        run: node --input-type=module -e "import {ProcessSupervisor} from './dist/index.js'; if (typeof ProcessSupervisor !== 'function') process.exit(1)"
