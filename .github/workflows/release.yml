@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: process-supervisor-release-${{ github.ref_name }}
@@ -53,7 +54,7 @@ jobs:
           npm pack --ignore-scripts --json > pack.json
           cat pack.json
           tarball="$(node -e "const result=require('./pack.json'); if (!Array.isArray(result) || result.length !== 1) process.exit(1); process.stdout.write(result[0].filename)")"
-          expected="process-supervisor-${GITHUB_REF_NAME#v}.tgz"
+          expected="$(node -e "const p=require('./package.json'); process.stdout.write(p.name.replace(/^@/, '').replaceAll('/', '-') + '-' + p.version + '.tgz')")"
           if [[ "${tarball}" != "${expected}" ]]; then
             echo "npm pack produced ${tarball}; expected ${expected}." >&2
             exit 1
@@ -89,6 +90,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${GITHUB_REF_NAME}" "${{ steps.pack.outputs.tarball }}" --repo "${GITHUB_REPOSITORY}" --clobber
+
+      - name: Set up GitHub Packages registry
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          registry-url: https://npm.pkg.github.com
+          scope: '@speto'
+          package-manager-cache: false
+
+      - name: Publish npm package
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+        run: npm publish "${{ steps.pack.outputs.tarball }}" --ignore-scripts
 
       - name: Publish GitHub Release
         env:

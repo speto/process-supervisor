@@ -34,30 +34,26 @@ See [Why `process-supervisor` exists](docs/why-process-supervisor.md) for the de
 
 ## Install
 
-Use the prebuilt npm-compatible tarball attached to the GitHub Release:
+The package is published privately to GitHub Packages. Configure the `@speto` scope in the consuming repository:
+
+```ini
+@speto:registry=https://npm.pkg.github.com
+```
+
+Authenticate npm with a GitHub token that has `read:packages`, then install the package:
 
 ```sh
-npm install https://github.com/speto/process-supervisor/releases/download/v0.1.0/process-supervisor-0.1.0.tgz
+npm install @speto/process-supervisor
 ```
 
-Or in `package.json`:
-
-```json
-{
-  "dependencies": {
-    "process-supervisor": "https://github.com/speto/process-supervisor/releases/download/v0.1.0/process-supervisor-0.1.0.tgz"
-  }
-}
-```
-
-The release asset is produced by `npm pack` and already contains the compiled library and prebuilt universal macOS process helper. Do not use GitHub's source archive as the package dependency.
+GitHub Actions can use its `GITHUB_TOKEN` when the consuming repository has read access to the package. The GitHub Release also contains the exact verified `npm pack` artifact, but GitHub Packages is the canonical dependency source.
 
 Node.js 22+. The built-in platform adapter supports macOS and Linux. Other platforms can provide their own `ProcessPlatform` implementation.
 
 ## Use
 
 ```ts
-import {ProcessSupervisor} from 'process-supervisor';
+import {ProcessSupervisor} from '@speto/process-supervisor';
 
 const supervisor = new ProcessSupervisor({
   stateDirectory: '/absolute/path/to/runtime-state',
@@ -191,6 +187,4 @@ npm run package:verify
 2. Run `npm ci`, `npm run check`, and `npm run package:verify`.
 3. Commit the release-ready source.
 4. Create and push the matching `vX.Y.Z` tag.
-5. GitHub Actions validates the tag, builds and verifies the package, then publishes the GitHub Release with `process-supervisor-X.Y.Z.tgz` attached.
-
-The package is not published to the npm registry.
+5. GitHub Actions validates the tag, builds and verifies the package, publishes the exact verified artifact as `@speto/process-supervisor` to GitHub Packages, then publishes the GitHub Release with the same tarball attached.

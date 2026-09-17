@@ -68,7 +68,7 @@ async function verifyConsumer(filename) {
       filename,
     ], consumer);
 
-    const installedPackage = join(consumer, 'node_modules', 'process-supervisor');
+    const installedPackage = join(consumer, 'node_modules', '@speto', 'process-supervisor');
     const installedEntries = await readdir(installedPackage);
     for (const forbidden of ['src', 'test', 'scripts', 'native', '.github', 'node_modules']) {
       assert.equal(installedEntries.includes(forbidden), false, `Installed package unexpectedly contains ${forbidden}/.`);
@@ -76,14 +76,14 @@ async function verifyConsumer(filename) {
 
     await writeFile(
       join(consumer, 'runtime.mjs'),
-      "import {ProcessSupervisor} from 'process-supervisor';\nif (typeof ProcessSupervisor !== 'function') throw new Error('ProcessSupervisor export is unavailable.');\n",
+      "import {ProcessSupervisor} from '@speto/process-supervisor';\nif (typeof ProcessSupervisor !== 'function') throw new Error('ProcessSupervisor export is unavailable.');\n",
       'utf8',
     );
     await run(process.execPath, ['runtime.mjs'], consumer);
 
     await writeFile(
       join(consumer, 'types.ts'),
-      "import {ProcessSupervisor, type ProcessPlatform} from 'process-supervisor';\nconst constructor: typeof ProcessSupervisor = ProcessSupervisor;\nlet platform!: ProcessPlatform;\nvoid constructor;\nvoid platform;\n",
+      "import {ProcessSupervisor, type ProcessPlatform} from '@speto/process-supervisor';\nconst constructor: typeof ProcessSupervisor = ProcessSupervisor;\nlet platform!: ProcessPlatform;\nvoid constructor;\nvoid platform;\n",
       'utf8',
     );
     const typeScriptCompiler = fileURLToPath(new URL('../node_modules/typescript/bin/tsc', import.meta.url));
@@ -113,7 +113,7 @@ async function verifyConsumer(filename) {
     }
 
     const installedMetadata = JSON.parse(await readFile(join(installedPackage, 'package.json'), 'utf8'));
-    assert.equal(installedMetadata.name, 'process-supervisor');
+    assert.equal(installedMetadata.name, '@speto/process-supervisor');
     assert.equal(typeof installedMetadata.version, 'string');
     console.log('Clean consumer verification passed: install, runtime import, and TypeScript declarations.');
   } finally {

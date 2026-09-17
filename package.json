@@ -1,6 +1,6 @@
 {
-  "name": "process-supervisor",
-  "version": "0.1.0",
+  "name": "@speto/process-supervisor",
+  "version": "0.1.1",
   "description": "Supervise owned subprocess scopes with persistent ownership and restart reconciliation.",
   "license": "MIT",
   "type": "module",
@@ -42,6 +42,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/speto/process-supervisor.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
   },
   "bugs": {
     "url": "https://github.com/speto/process-supervisor/issues"
