@@ -35,6 +35,15 @@ export interface RuntimeProcess {
   expectedStop: boolean;
 }
 
+export type ProcessLaunchResult =
+  | {kind: 'running'; runtime: RuntimeProcess}
+  | {kind: 'exited'; record: DurableProcessRecord; code: number | null; signal: NodeJS.Signals | null};
+
+export interface ProcessLaunchCallbacks {
+  onExit(child: ChildProcess, code: number | null, signal: NodeJS.Signals | null): void;
+  onSpawned?(child: ChildProcess): void;
+}
+
 export interface ProcessRuntimeContext {
   stateDirectory: string;
   recordStore: ProcessRecordStore;
@@ -64,8 +73,8 @@ export class ProcessLaunchFailure extends Error {
 export async function launchProcess(
   spec: NormalizedProcessSpec,
   context: ProcessRuntimeContext,
-  onExit: (child: ChildProcess, code: number | null, signal: NodeJS.Signals | null) => void,
-): Promise<RuntimeProcess> {
+  callbacks: ProcessLaunchCallbacks,
+): Promise<ProcessLaunchResult> {
   let durableLogs: DurableLogFiles | null = null;
   let child: ChildProcess | null = null;
   let launchScope: ProcessScope | null = null;
@@ -81,6 +90,7 @@ export async function launchProcess(
     child = context.platform.spawn({
       executable: spec.executable,
       args: spec.args,
+      ...(spec.argv0 === undefined ? {} : {argv0: spec.argv0}),
       cwd: spec.cwd,
       stdio: durableLogs
         ? ['ignore', durableLogs.stdoutHandle.fd, durableLogs.stderrHandle.fd]
@@ -92,27 +102,23 @@ export async function launchProcess(
 
     if (spec.ioMode === 'line') attachChildOutput(spec.id, child, context.onOutput);
     const launchedChild = child;
-    child.once('exit', (code, signal) => onExit(launchedChild, code, signal));
+    child.once('exit', (code, signal) => callbacks.onExit(launchedChild, code, signal));
 
     const pid = await waitForSpawn(child);
     launchScope = context.platform.scopeForSpawnedProcess(pid);
-    const inspection = await waitForInspection(context.platform, pid, 500, context.groupPollMs);
-    if (!inspection) throw new Error(`Process ${spec.id} exited before its identity could be captured.`);
-    if (!scopeEquals(launchScope, inspection.scope)) {
-      throw new Error(`Process ${spec.id} changed ownership scope before its identity could be captured.`);
-    }
+    callbacks.onSpawned?.(child);
 
     record = {
       schemaVersion: 3,
       id: spec.id,
       pid,
-      scope: inspection.scope,
+      scope: launchScope,
       executable: spec.executable,
       cwd: spec.cwd,
       ioMode: spec.ioMode,
       recoveryPolicy: spec.recoveryPolicy,
       shutdownPolicy: spec.shutdownPolicy,
-      identity: identityFromInspection(inspection),
+      identity: {startedAt: null, stableId: null},
       ...(durableLogs ? {logs: durableLogs.logs} : {}),
       createdAt: context.now().toISOString(),
       metadata: spec.metadata,
@@ -121,13 +127,41 @@ export async function launchProcess(
     await context.recordStore.save(record);
     recordSaved = true;
 
+    const inspection = await waitForInspection(
+      context.platform,
+      pid,
+      500,
+      context.groupPollMs,
+      () => child?.exitCode !== null || child?.signalCode !== null,
+    );
+    if (!inspection) {
+      const scopeAlive = await context.platform.isScopeAlive(launchScope);
+      if (!scopeAlive) {
+        const exit = await childExitStatus(child);
+        await context.recordStore.remove(spec.id);
+        recordSaved = false;
+        return {kind: 'exited', record, code: exit.code, signal: exit.signal};
+      }
+      throw new Error(`Process ${spec.id} exited before its identity could be captured.`);
+    }
+    if (!scopeEquals(launchScope, inspection.scope)) {
+      throw new Error(`Process ${spec.id} changed ownership scope before its identity could be captured.`);
+    }
+
+    record = {
+      ...record,
+      scope: inspection.scope,
+      identity: identityFromInspection(inspection),
+    };
+    await context.recordStore.save(record);
+
     runtime = createRuntime(record, child, context);
     if (durableLogs) {
       child.unref();
       await Promise.all(runtime.followers.map((follower) => follower.start(false)));
     }
 
-    return runtime;
+    return {kind: 'running', runtime};
   } catch (error) {
     if (runtime) releaseRuntime(runtime);
     if (child?.pid) {
@@ -261,10 +295,28 @@ async function cleanupFailedLaunch(
     );
     return {error: null, runtime: null, recordPersisted: recordSaved};
   } catch (cleanupError) {
+    let retainedRecord = record;
+    if (retainedRecord.identity.stableId === null) {
+      try {
+        const inspection = await waitForInspection(
+          context.platform,
+          retainedRecord.pid,
+          500,
+          context.groupPollMs,
+          () => child.exitCode !== null || child.signalCode !== null,
+        );
+        if (inspection && scopeEquals(retainedRecord.scope, inspection.scope)) {
+          retainedRecord = {...retainedRecord, scope: inspection.scope, identity: identityFromInspection(inspection)};
+        }
+      } catch {
+        // Retain provisional ownership when stable identity still cannot be proven.
+      }
+    }
+
     let persisted = recordSaved;
     if (!persisted) {
       try {
-        await context.recordStore.save(record);
+        await context.recordStore.save(retainedRecord);
         persisted = true;
       } catch {
         // In-memory ownership is still retained even if durable persistence is unavailable.
@@ -272,7 +324,7 @@ async function cleanupFailedLaunch(
     }
     return {
       error: cleanupError,
-      runtime: createRuntime(record, child, context),
+      runtime: createRuntime(retainedRecord, child, context),
       recordPersisted: persisted,
     };
   }
@@ -383,4 +435,28 @@ function scopeEquals(left: ProcessScope, right: ProcessScope): boolean {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function childExitStatus(
+  child: ChildProcess,
+): Promise<{code: number | null; signal: NodeJS.Signals | null}> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve({code: child.exitCode, signal: child.signalCode});
+  }
+  return new Promise((resolve, reject) => {
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      resolve({code, signal});
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const cleanup = () => {
+      child.off('exit', onExit);
+      child.off('error', onError);
+    };
+    child.once('exit', onExit);
+    child.once('error', onError);
+  });
 }

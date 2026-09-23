@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {chmod, mkdtemp, readdir, rm, stat, symlink, writeFile} from 'node:fs/promises';
+import {chmod, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile} from 'node:fs/promises';
 import {once} from 'node:events';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -616,3 +616,184 @@ class FailOnceSaveRecordStore implements ProcessRecordStore {
     return this.delegate.remove(processId);
   }
 }
+
+test('runs a finite process and returns its exit status and bounded output without treating a non-zero exit as a crash', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'process-supervisor-run-exit-'));
+  const supervisor = new ProcessSupervisor({stateDirectory: join(root, 'state'), groupPollMs: 10});
+
+  try {
+    const result = await supervisor.run({
+      id: 'finite-exit',
+      executable: process.execPath,
+      args: ['-e', 'process.stdout.write("stdout-value"); process.stderr.write("stderr-value"); process.exit(7);'],
+      cwd: root,
+    });
+
+    assert.deepEqual(result, {
+      reason: 'exited',
+      exitCode: 7,
+      signal: null,
+      stdout: 'stdout-value',
+      stderr: 'stderr-value',
+      forcedTermination: false,
+    });
+    assert.equal(supervisor.getSnapshot('finite-exit')?.state, 'stopped');
+  } finally {
+    await supervisor.close();
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test('stop terminates the whole scope of an active finite process and resolves the run as stopped', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'process-supervisor-run-stop-'));
+  const childPidPath = join(root, 'child.pid');
+  const supervisor = new ProcessSupervisor({
+    stateDirectory: join(root, 'state'),
+    gracefulShutdownMs: 100,
+    forcedShutdownMs: 500,
+    groupPollMs: 10,
+  });
+
+  try {
+    const running = supervisor.run({
+      id: 'finite-stop',
+      executable: process.execPath,
+      args: ['-e', `const fs=require('node:fs'); const {spawn}=require('node:child_process'); const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'}); fs.writeFileSync(${JSON.stringify(childPidPath)},String(child.pid)); setInterval(()=>{},1000);`],
+      cwd: root,
+    });
+    const rootPid = await waitFor(() => supervisor.getSnapshot('finite-stop')?.pid ?? undefined);
+    const nestedPid = await waitForAsync(async () => {
+      try {
+        const value = Number((await readFile(childPidPath, 'utf8')).trim());
+        return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+      } catch {
+        return undefined;
+      }
+    }, 3_000);
+
+    assert.equal(alive(rootPid), true);
+    assert.equal(alive(nestedPid), true);
+    await supervisor.stop('finite-stop');
+    const result = await running;
+
+    assert.equal(result.reason, 'stopped');
+    assert.equal(alive(rootPid), false);
+    assert.equal(alive(nestedPid), false);
+  } finally {
+    await supervisor.close();
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test('finite-process timeout uses the shared graceful-to-forced termination path', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'process-supervisor-run-timeout-'));
+  const supervisor = new ProcessSupervisor({
+    stateDirectory: join(root, 'state'),
+    gracefulShutdownMs: 75,
+    forcedShutdownMs: 500,
+    groupPollMs: 10,
+  });
+
+  try {
+    const result = await supervisor.run({
+      id: 'finite-timeout',
+      executable: process.execPath,
+      args: ['-e', 'process.on("SIGTERM",()=>{}); setInterval(()=>{},1000);'],
+      cwd: root,
+    }, {timeoutMs: 2_000});
+
+    assert.equal(result.reason, 'timed_out');
+    assert.equal(result.forcedTermination, true);
+    assert.equal(supervisor.getSnapshot('finite-timeout')?.state, 'stopped');
+  } finally {
+    await supervisor.close();
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test('finite-process output limit is enforced by stopping the owned process scope', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'process-supervisor-run-output-limit-'));
+  const supervisor = new ProcessSupervisor({
+    stateDirectory: join(root, 'state'),
+    gracefulShutdownMs: 100,
+    forcedShutdownMs: 500,
+    groupPollMs: 10,
+  });
+
+  try {
+    const result = await supervisor.run({
+      id: 'finite-output-limit',
+      executable: process.execPath,
+      args: ['-e', 'process.stdout.write("x".repeat(4096)); setInterval(()=>{},1000);'],
+      cwd: root,
+    }, {maxOutputBytes: 128});
+
+    assert.equal(result.reason, 'output_limit');
+    assert.equal(Buffer.byteLength(result.stdout), 128);
+    assert.equal(result.stderr, '');
+    assert.equal(supervisor.getSnapshot('finite-output-limit')?.state, 'stopped');
+  } finally {
+    await supervisor.close();
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test('a running finite process does not hold the ownership coordinator', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'process-supervisor-run-concurrency-'));
+  const supervisor = new ProcessSupervisor({stateDirectory: join(root, 'state'), groupPollMs: 10});
+
+  try {
+    const finite = supervisor.run({
+      id: 'finite-concurrent',
+      executable: process.execPath,
+      args: ['-e', 'setTimeout(()=>process.exit(0),500);'],
+      cwd: root,
+    });
+    await waitFor(() => supervisor.getSnapshot('finite-concurrent')?.state === 'running' ? true : undefined);
+    assert.throws(
+      () => supervisor.getTransport('finite-concurrent'),
+      (error: unknown) => error instanceof ProcessSupervisorError && error.code === 'PROCESS_NOT_FOUND',
+    );
+
+    const service = await Promise.race([
+      supervisor.start({
+        id: 'parallel-service',
+        executable: process.execPath,
+        args: ['-e', 'setInterval(()=>{},1000);'],
+        cwd: root,
+      }),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('parallel lifecycle operation was serialized behind run()')), 250)),
+    ]);
+    assert.equal(service.state, 'running');
+    await supervisor.stop('parallel-service');
+    assert.equal((await finite).reason, 'exited');
+  } finally {
+    await supervisor.close();
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test('argv0 provides an observable POSIX process-table label without changing the executable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'process-supervisor-argv0-'));
+  const supervisor = new ProcessSupervisor({stateDirectory: join(root, 'state'), groupPollMs: 10});
+  const platform = new PosixProcessPlatform();
+
+  try {
+    const running = await supervisor.start({
+      id: 'labelled-process',
+      executable: '/bin/sleep',
+      args: ['30'],
+      argv0: 'gradus:test-worker',
+      cwd: root,
+    });
+
+    const inspection = await platform.inspect(running.pid!);
+    assert.ok(inspection);
+    assert.match(inspection.commandLine, /^gradus:test-worker(?:\s|$)/u);
+    assert.equal(running.scope?.kind, 'posix-process-group');
+    assert.equal(running.scope?.id, String(running.pid));
+  } finally {
+    await supervisor.close();
+    await rm(root, {recursive: true, force: true});
+  }
+});

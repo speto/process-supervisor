@@ -31,12 +31,13 @@ export async function waitForInspection(
   pid: number,
   timeoutMs: number,
   pollMs: number,
+  shouldStop: () => boolean = () => false,
 ): Promise<ProcessInspection | null> {
   const deadline = Date.now() + timeoutMs;
   while (true) {
     const inspection = await platform.inspect(pid);
     if (inspection) return inspection;
-    if (Date.now() >= deadline) return null;
+    if (shouldStop() || Date.now() >= deadline) return null;
     await delay(Math.min(pollMs, Math.max(1, deadline - Date.now())));
   }
 }

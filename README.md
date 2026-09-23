@@ -2,14 +2,15 @@
 
 Own subprocess scopes explicitly, stop them reliably, and reconcile persistent ownership after the supervising process restarts.
 
-Use it for long-running developer tools and local services that need stronger lifecycle guarantees than a raw `child_process.spawn()` call.
+Use it for long-running developer tools, local services, and finite commands that need stronger lifecycle guarantees than a raw `child_process.spawn()` call.
 
 It provides:
 
 - direct executable launch with no shell by default;
 - exclusive ownership of the default file-backed state directory;
 - isolated POSIX process groups and whole-group graceful → forced shutdown;
-- line-oriented output, raw stdio transport, or durable file-backed logs;
+- line-oriented output, raw stdio transport, durable file-backed logs, or bounded finite-command output;
+- finite command execution with timeout and the same whole-scope stop semantics;
 - stable PID-reuse protection based on process-start identity;
 - restart reconciliation for terminating or adopting surviving processes.
 
@@ -75,7 +76,31 @@ await supervisor.close();
 
 Executables and working directories must be absolute. Commands are launched directly with `shell: false`.
 
+An optional `argv0` can give a managed process a recognizable POSIX process title without changing the executable that is launched. Node documents this as the process title on macOS and Linux; treat it as an operational label, not an ownership or identity proof, and do not assume every process-manager UI renders it identically.
+
 The default I/O mode is `line`: stdout/stderr are emitted as bounded line events through `onOutput`.
+
+## Finite commands
+
+Use `run()` when a process is expected to exit on its own:
+
+```ts
+const result = await supervisor.run({
+  id: 'validation',
+  executable: '/absolute/path/to/npm',
+  args: ['test'],
+  cwd: '/absolute/path/to/project',
+}, {
+  timeoutMs: 300_000,
+  maxOutputBytes: 8 * 1024 * 1024,
+});
+```
+
+A finite command uses the same owned process scope, durable ownership, stable identity checks, reconciliation, and graceful → forced termination as a long-running process. Natural exit resolves normally even when the exit code is non-zero; the caller decides what that exit code means.
+
+While `run()` is pending, `stop(id)` stops the same owned process scope and the run resolves with `reason: 'stopped'`. A timeout or combined stdout/stderr output limit terminates the scope through the same stop path and reports `timed_out` or `output_limit`.
+
+Finite commands use terminate-on-recovery semantics and are not adopted or preserved across supervisor replacement.
 
 ## Raw stdio
 

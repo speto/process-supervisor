@@ -76,14 +76,14 @@ async function verifyConsumer(filename) {
 
     await writeFile(
       join(consumer, 'runtime.mjs'),
-      "import {ProcessSupervisor} from '@speto/process-supervisor';\nif (typeof ProcessSupervisor !== 'function') throw new Error('ProcessSupervisor export is unavailable.');\n",
+      "import {ProcessSupervisor} from '@speto/process-supervisor';\nif (typeof ProcessSupervisor !== 'function') throw new Error('ProcessSupervisor export is unavailable.');\nif (typeof ProcessSupervisor.prototype.run !== 'function') throw new Error('ProcessSupervisor.run is unavailable.');\n",
       'utf8',
     );
     await run(process.execPath, ['runtime.mjs'], consumer);
 
     await writeFile(
       join(consumer, 'types.ts'),
-      "import {ProcessSupervisor, type ProcessPlatform} from '@speto/process-supervisor';\nconst constructor: typeof ProcessSupervisor = ProcessSupervisor;\nlet platform!: ProcessPlatform;\nvoid constructor;\nvoid platform;\n",
+      "import {ProcessSupervisor, type ProcessExecutionSpec, type ProcessPlatform, type ProcessRunResult} from '@speto/process-supervisor';\nconst constructor: typeof ProcessSupervisor = ProcessSupervisor;\nconst execution: ProcessExecutionSpec = {id: 'finite', executable: '/bin/true', args: [], cwd: '/tmp'};\ndeclare const supervisor: ProcessSupervisor;\nconst runResult: Promise<ProcessRunResult> = supervisor.run(execution);\nlet platform!: ProcessPlatform;\nvoid constructor;\nvoid execution;\nvoid runResult;\nvoid platform;\n",
       'utf8',
     );
     const typeScriptCompiler = fileURLToPath(new URL('../node_modules/typescript/bin/tsc', import.meta.url));

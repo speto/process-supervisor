@@ -103,3 +103,33 @@ test('failed identity capture cleans the entire provisional process scope', asyn
     await rm(root, {recursive: true, force: true});
   }
 });
+
+test('finite run can complete safely before stable identity capture', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'process-supervisor-short-run-'));
+  const platform = new IdentityCaptureFailurePlatform();
+  const supervisor = new ProcessSupervisor({
+    stateDirectory: join(root, 'state'),
+    platform,
+    groupPollMs: 10,
+  });
+
+  try {
+    const result = await supervisor.run({
+      id: 'short-run',
+      executable: '/usr/bin/true',
+      args: [],
+      cwd: root,
+    });
+
+    assert.equal(result.reason, 'exited');
+    assert.equal(result.exitCode, 0);
+    assert.equal(platform.terminatedScopes.length, 0);
+    assert.equal(supervisor.getSnapshot('short-run')?.state, 'stopped');
+  } finally {
+    await supervisor.close().catch(() => undefined);
+    if (platform.spawnedPid && alive(platform.spawnedPid)) {
+      process.kill(-platform.spawnedPid, 'SIGKILL');
+    }
+    await rm(root, {recursive: true, force: true});
+  }
+});

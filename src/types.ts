@@ -26,16 +26,36 @@ export interface ProcessEnvironmentPolicy {
   values?: Readonly<Record<string, string>>;
 }
 
-export interface ManagedProcessSpec {
+export interface ProcessExecutionSpec {
   id: string;
   executable: string;
   args: readonly string[];
+  argv0?: string;
   cwd: string;
+  environment?: ProcessEnvironmentPolicy;
+  metadata?: Readonly<Record<string, JsonValue>>;
+}
+
+export interface ManagedProcessSpec extends ProcessExecutionSpec {
   ioMode?: ProcessIoMode;
   recoveryPolicy?: ProcessRecoveryPolicy;
   shutdownPolicy?: ProcessShutdownPolicy;
-  environment?: ProcessEnvironmentPolicy;
-  metadata?: Readonly<Record<string, JsonValue>>;
+}
+
+export interface ProcessRunOptions {
+  timeoutMs?: number;
+  maxOutputBytes?: number;
+}
+
+export type ProcessRunReason = 'exited' | 'stopped' | 'timed_out' | 'output_limit';
+
+export interface ProcessRunResult {
+  reason: ProcessRunReason;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  forcedTermination: boolean;
 }
 
 export interface ProcessScope {
@@ -63,6 +83,7 @@ export interface ProcessInspection extends ProcessProbe {
 export interface ProcessSpawnRequest {
   executable: string;
   args: readonly string[];
+  argv0?: string;
   cwd: string;
   env: NodeJS.ProcessEnv;
   stdio: StdioOptions;

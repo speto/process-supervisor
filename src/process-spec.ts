@@ -9,6 +9,7 @@ import type {
   ManagedProcessSnapshot,
   ManagedProcessSpec,
   ProcessEnvironmentPolicy,
+  ProcessExecutionSpec,
   ProcessInspection,
   ProcessIoMode,
   ProcessProbe,
@@ -23,6 +24,7 @@ export interface NormalizedProcessSpec {
   id: string;
   executable: string;
   args: readonly string[];
+  argv0?: string;
   cwd: string;
   ioMode: ProcessIoMode;
   recoveryPolicy: ProcessRecoveryPolicy;
@@ -31,7 +33,55 @@ export interface NormalizedProcessSpec {
   metadata: Readonly<Record<string, JsonValue>>;
 }
 
+interface NormalizedExecutionSpec {
+  id: string;
+  executable: string;
+  args: readonly string[];
+  argv0?: string;
+  cwd: string;
+  environment: ProcessEnvironmentPolicy;
+  metadata: Readonly<Record<string, JsonValue>>;
+}
+
 export function normalizeSpec(spec: ManagedProcessSpec): NormalizedProcessSpec {
+  const execution = normalizeExecutionSpec(spec);
+  const ioMode = spec.ioMode ?? 'line';
+  const recoveryPolicy = spec.recoveryPolicy ?? 'terminate';
+  const shutdownPolicy = spec.shutdownPolicy ?? 'terminate';
+  if (ioMode !== 'line' && ioMode !== 'pipe' && ioMode !== 'durable-log') {
+    throw invalidSpec(`Unsupported I/O mode: ${String(ioMode)}.`);
+  }
+  if (recoveryPolicy !== 'terminate' && recoveryPolicy !== 'adopt') {
+    throw invalidSpec(`Unsupported recovery policy: ${String(recoveryPolicy)}.`);
+  }
+  if (shutdownPolicy !== 'terminate' && shutdownPolicy !== 'preserve') {
+    throw invalidSpec(`Unsupported shutdown policy: ${String(shutdownPolicy)}.`);
+  }
+  if (recoveryPolicy === 'adopt' && ioMode !== 'durable-log') {
+    throw new ProcessSupervisorError('UNSUPPORTED_RECOVERY', 'Adopt recovery requires durable-log I/O.');
+  }
+  if (shutdownPolicy === 'preserve' && ioMode !== 'durable-log') {
+    throw new ProcessSupervisorError('UNSUPPORTED_RECOVERY', 'Preserve shutdown requires durable-log I/O.');
+  }
+
+  return {
+    ...execution,
+    ioMode,
+    recoveryPolicy,
+    shutdownPolicy,
+  };
+}
+
+export function normalizeRunSpec(spec: ProcessExecutionSpec): NormalizedProcessSpec {
+  return {
+    ...normalizeExecutionSpec(spec),
+    ioMode: 'pipe',
+    recoveryPolicy: 'terminate',
+    shutdownPolicy: 'terminate',
+  };
+}
+
+function normalizeExecutionSpec(spec: ProcessExecutionSpec): NormalizedExecutionSpec {
   if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
     throw invalidSpec('Managed process specification is required.');
   }
@@ -55,34 +105,19 @@ export function normalizeSpec(spec: ManagedProcessSpec): NormalizedProcessSpec {
   ) {
     throw invalidSpec('Managed process arguments must be an array of strings without NUL characters.');
   }
-
-  const ioMode = spec.ioMode ?? 'line';
-  const recoveryPolicy = spec.recoveryPolicy ?? 'terminate';
-  const shutdownPolicy = spec.shutdownPolicy ?? 'terminate';
-  if (ioMode !== 'line' && ioMode !== 'pipe' && ioMode !== 'durable-log') {
-    throw invalidSpec(`Unsupported I/O mode: ${String(ioMode)}.`);
-  }
-  if (recoveryPolicy !== 'terminate' && recoveryPolicy !== 'adopt') {
-    throw invalidSpec(`Unsupported recovery policy: ${String(recoveryPolicy)}.`);
-  }
-  if (shutdownPolicy !== 'terminate' && shutdownPolicy !== 'preserve') {
-    throw invalidSpec(`Unsupported shutdown policy: ${String(shutdownPolicy)}.`);
-  }
-  if (recoveryPolicy === 'adopt' && ioMode !== 'durable-log') {
-    throw new ProcessSupervisorError('UNSUPPORTED_RECOVERY', 'Adopt recovery requires durable-log I/O.');
-  }
-  if (shutdownPolicy === 'preserve' && ioMode !== 'durable-log') {
-    throw new ProcessSupervisorError('UNSUPPORTED_RECOVERY', 'Preserve shutdown requires durable-log I/O.');
+  if (
+    spec.argv0 !== undefined
+    && (typeof spec.argv0 !== 'string' || spec.argv0.length === 0 || spec.argv0.includes('\0'))
+  ) {
+    throw invalidSpec('Managed process argv0 must be a non-empty string without NUL characters.');
   }
 
   return {
     id: spec.id,
     executable: spec.executable,
     args: [...spec.args],
+    ...(spec.argv0 === undefined ? {} : {argv0: spec.argv0}),
     cwd: spec.cwd,
-    ioMode,
-    recoveryPolicy,
-    shutdownPolicy,
     environment: normalizeEnvironment(spec.environment),
     metadata: cloneMetadata(spec.metadata ?? {}),
   };

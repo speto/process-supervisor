@@ -35,6 +35,7 @@ export class PosixProcessPlatform implements ProcessPlatform {
 
   spawn(request: ProcessSpawnRequest) {
     return nodeSpawn(request.executable, [...request.args], {
+      ...(request.argv0 === undefined ? {} : {argv0: request.argv0}),
       cwd: request.cwd,
       detached: true,
       shell: false,

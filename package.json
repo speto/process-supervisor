@@ -1,6 +1,6 @@
 {
   "name": "@speto/process-supervisor",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Supervise owned subprocess scopes with persistent ownership and restart reconciliation.",
   "license": "MIT",
   "type": "module",
